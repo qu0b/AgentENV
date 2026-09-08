@@ -16,7 +16,7 @@ use crate::snapshot::{
     SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
     SnapshotSourceKind, TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
 };
-use crate::volume::{is_valid_volume_component, VolumeMode, VolumeRecord};
+use crate::volume::{is_valid_volume_component, VolumeMode, VolumeRecord, VolumeStatus};
 const FILE_LOCK_TIMEOUT: Option<Duration> = Some(Duration::from_secs(10));
 
 pub struct PosixFsCatalogStore {
@@ -507,6 +507,11 @@ impl PosixFsCatalogStore {
                 lookup: volume_id.to_string(),
             }
         })?;
+        if record.deleting || record.status != VolumeStatus::Ready {
+            return Err(RepositoryError::InvalidRequest {
+                reason: format!("volume '{volume_id}' is not ready for reservation"),
+            });
+        }
         if record.mode == VolumeMode::ReadOnly {
             return Ok(None);
         }
@@ -535,6 +540,11 @@ impl PosixFsCatalogStore {
                 lookup: volume_id.to_string(),
             }
         })?;
+        if record.deleting || record.status != VolumeStatus::Ready {
+            return Err(RepositoryError::InvalidRequest {
+                reason: format!("volume '{volume_id}' is not ready for reservation"),
+            });
+        }
         if record.mode != VolumeMode::ReadOnly {
             return Err(RepositoryError::InvalidRequest {
                 reason: format!("volume '{volume_id}' is not read-only"),
@@ -1117,7 +1127,7 @@ mod tests {
         CommittedSnapshot, SnapshotAlias, SnapshotId, SnapshotListFilter, SnapshotPublishMetadata,
         SnapshotPublishSource, SnapshotRecord, SnapshotSourceKind, TemplateBuildStatus,
     };
-    use crate::volume::{VolumeMode, VolumeRecord};
+    use crate::volume::{VolumeMode, VolumeRecord, VolumeStatus};
 
     #[test]
     fn begin_and_commit_make_snapshot_visible() {
@@ -1354,6 +1364,56 @@ mod tests {
             backing_layers: Vec::new(),
             read_only_mounts: Vec::new(),
             deleting: false,
+        }
+    }
+
+    #[test]
+    fn volume_reservation_rechecks_readiness_under_the_catalog_lock() {
+        for mode in [VolumeMode::Exclusive, VolumeMode::ReadOnly] {
+            for (status, deleting) in [
+                (VolumeStatus::Uploading, false),
+                (VolumeStatus::Failed, false),
+                (VolumeStatus::Ready, true),
+            ] {
+                for already_owned in [false, true] {
+                    let root = TempDir::new().unwrap();
+                    let store = PosixFsCatalogStore::new(root.path().to_owned());
+                    let mut record = volume_record(1);
+                    record.mode = mode;
+                    if already_owned {
+                        if mode == VolumeMode::Exclusive {
+                            record.reserved_by_sandbox_id = Some("request-owner".into());
+                        } else {
+                            record.read_only_mounts.push("request-owner".into());
+                        }
+                    }
+                    store.create_volume(&record).unwrap();
+                    let earlier_read = store.get_volume(&record.id).unwrap().unwrap();
+                    assert_eq!(earlier_read.status, VolumeStatus::Ready);
+                    // Publication/deletion wins after the caller's ready read
+                    // and before its authoritative reservation operation.
+                    record.status = status;
+                    record.deleting = deleting;
+                    store.put_volume(&record).unwrap();
+                    let reservation = if mode == VolumeMode::Exclusive {
+                        store
+                            .reserve_volume(&record.id, "request-owner")
+                            .map(|_| ())
+                    } else {
+                        store.reserve_read_only_volume(&record.id, "request-owner")
+                    };
+                    assert!(
+                        reservation.is_err(),
+                        "a stale ready read cannot authorize reservation"
+                    );
+                    let persisted = store.get_volume(&record.id).unwrap().unwrap();
+                    assert_eq!(
+                        persisted.reserved_by_sandbox_id,
+                        earlier_read.reserved_by_sandbox_id
+                    );
+                    assert_eq!(persisted.read_only_mounts, earlier_read.read_only_mounts);
+                }
+            }
         }
     }
 

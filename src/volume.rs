@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::snapshot::repository::{RepositoryError, SnapshotRepository};
 use crate::snapshot::OverlaybdLayerRef;
+use crate::types::SandboxId;
 
 pub const DEFAULT_VOLUME_SIZE_MB: u64 = 64 * 1024;
 /// Firecracker exposes /dev/vdc through /dev/vdz for extra drives.
@@ -446,6 +447,7 @@ impl VolumeManager {
         mode: VolumeMode,
         size_mb: u64,
         backing_layers: Vec<OverlaybdLayerRef>,
+        owner: Option<SandboxId>,
     ) -> Result<VolumeRecord, VolumeError> {
         validate_name(&name)?;
         if size_mb == 0 || backing_layers.is_empty() {
@@ -462,16 +464,25 @@ impl VolumeManager {
             Err(error) => return Err(error),
         }
 
+        let owner = owner.map(|id| id.to_string());
         let record = VolumeRecord {
             id: format!("vol_{}", Uuid::now_v7().simple()),
             name,
             mode,
             size_mb,
             status: VolumeStatus::Ready,
-            reserved_by_sandbox_id: None,
+            reserved_by_sandbox_id: if mode == VolumeMode::Exclusive {
+                owner.clone()
+            } else {
+                None
+            },
             backing_image_config: None,
             backing_layers,
-            read_only_mounts: Vec::new(),
+            read_only_mounts: if mode == VolumeMode::ReadOnly {
+                owner.into_iter().collect()
+            } else {
+                Vec::new()
+            },
             deleting: false,
         };
         self.repository
@@ -821,6 +832,121 @@ mod tests {
     use crate::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
     use crate::snapshot::{ManagedLayer, OverlaybdLayerRef};
 
+    async fn preparation_manager(root: &std::path::Path) -> anyhow::Result<VolumeManager> {
+        let backend = PosixFsBackend::new(PosixFsBackendConfig {
+            root: root.join("repository"),
+            cache_root: Some(root.join("cache")),
+            runtime_cache_root: Some(root.join("runtime")),
+        })?;
+        VolumeManager::open_with_repository(root.join("volumes/catalog"), backend.repository())
+            .await
+    }
+
+    #[tokio::test]
+    async fn restore_volume_process_worker() -> anyhow::Result<()> {
+        let Some(root) = std::env::var_os("EU919_RESTORE_CHILD_ROOT") else {
+            return Ok(());
+        };
+        let root = std::path::PathBuf::from(root);
+        let mode = if std::env::var("EU919_RESTORE_CHILD_MODE")?.as_str() == "readonly" {
+            VolumeMode::ReadOnly
+        } else {
+            VolumeMode::Exclusive
+        };
+        let owner = crate::types::SandboxId::new();
+        let manager = preparation_manager(&root).await?;
+        let volume = manager
+            .create_from_snapshot(
+                "interrupted-restore".into(),
+                mode,
+                64,
+                vec![OverlaybdLayerRef::Managed(ManagedLayer {
+                    digest: format!("sha256:{}", "a".repeat(64)),
+                    size: 4096,
+                    uuid: None,
+                })],
+                Some(owner),
+            )
+            .await?;
+        // No follow-up reserve or VM launch occurs before the crash boundary.
+        let marker = serde_json::json!({"volume": volume.id, "owner": owner.to_string()});
+        tokio::fs::write(root.join("ready.tmp"), serde_json::to_vec(&marker)?).await?;
+        tokio::fs::rename(root.join("ready.tmp"), root.join("ready.json")).await?;
+        std::future::pending::<()>().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restored_volume_has_its_original_owner_after_sigkill_before_mount_preparation(
+    ) -> anyhow::Result<()> {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        for mode in ["exclusive", "readonly"] {
+            let root = tempfile::tempdir()?;
+            let log = std::fs::File::create(root.path().join("child.log"))?;
+            let mut child = Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "volume::tests::restore_volume_process_worker",
+                    "--nocapture",
+                ])
+                .env("EU919_RESTORE_CHILD_ROOT", root.path())
+                .env("EU919_RESTORE_CHILD_MODE", mode)
+                .stdout(Stdio::from(log.try_clone()?))
+                .stderr(Stdio::from(log))
+                .spawn()?;
+            let boundary = async {
+                let deadline = Instant::now() + Duration::from_secs(15);
+                while !root.path().join("ready.json").exists() {
+                    if let Some(status) = child.try_wait()? {
+                        anyhow::bail!("restore child ended before boundary: {status}");
+                    }
+                    anyhow::ensure!(
+                        Instant::now() < deadline,
+                        "restore child did not reach boundary"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                anyhow::Ok(())
+            }
+            .await;
+            let killed = child.kill();
+            let status = child.wait()?;
+            boundary?;
+            killed?;
+            assert_eq!(status.signal(), Some(9));
+            let marker: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(root.path().join("ready.json"))?)?;
+            let volume_id = marker["volume"].as_str().unwrap();
+            let owner = marker["owner"].as_str().unwrap();
+            let fresh = preparation_manager(root.path()).await?;
+            let record = fresh.get(volume_id).await?;
+            assert!(
+                record.mounted_by(owner),
+                "first durable volume record must carry its original owner"
+            );
+            assert_eq!(fresh.list_page(None, 10).await?.records.len(), 1);
+            assert!(matches!(
+                fresh.delete(volume_id).await,
+                Err(super::VolumeError::Reserved(_))
+            ));
+            if mode == "exclusive" {
+                assert!(matches!(
+                    fresh.reserve(volume_id, "another-vm").await,
+                    Err(super::VolumeError::Reserved(_))
+                ));
+            } else {
+                assert_eq!(record.read_only_mounts, vec![owner]);
+            }
+            fresh
+                .replace_owner_for(owner, None, &[volume_id.to_owned()])
+                .await?;
+            fresh.delete(volume_id).await?;
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn create_from_snapshot_preserves_read_only_mode() {
         let temp = tempfile::tempdir().expect("temporary volume repository");
@@ -847,6 +973,7 @@ mod tests {
                     size: 4096,
                     uuid: None,
                 })],
+                None,
             )
             .await
             .expect("restore volume snapshot");

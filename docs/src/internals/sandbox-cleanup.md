@@ -51,6 +51,36 @@ as cache. Recovery must identify and stop the original runtime and resolve its
 owned resources before recording completion. Node loss, partial storage loss,
 and cross-node failover still require qualification and further implementation.
 
+## Ownership before mount preparation
+
+A volume restored from a snapshot now carries the final sandbox owner in its
+first durable volume record, for both exclusive and read-only modes. There is
+no unowned record between creation and mount reservation. Mount preparation
+can idempotently reserve that same owner later. A server loss before preparation
+therefore retains the original owner in the volume catalog, even before a native
+sandbox cleanup record exists. This establishes identity, not proof that no VM
+started and not automatic recovery of the interrupted allocation.
+
+The API validates the complete snapshot mount layout before creating children:
+mount-count limits, normalization, duplicates, and parent/child overlaps. Distinct
+path components such as `/data` and `/database` remain valid. If a later child
+creation or mount-materialization step fails before launch, cleanup releases
+only the original attempt's owner across all restored IDs and deletes only
+unreserved children. Another owner prevents deletion; cleanup errors propagate.
+
+The POSIX catalog rechecks `status=ready` and `deleting=false` while holding the
+record lock for both reservation methods, including same-owner retries. An
+earlier manager-level ready read cannot authorize a reservation after publication
+or deletion changes the record. The OSS reservation implementation already uses
+these checks inside its conditional-write loop and is unchanged here.
+
+Drain all older reservation writers sharing a POSIX catalog before cutover.
+The catalog format and public API are unchanged, but old writers bypass this
+barrier. Previously unowned restored records cannot be assigned to a sandbox by
+guessing; preserve and reconcile them using original allocation evidence.
+Rollback must retain this barrier and initial ownership as well as the previous
+stop/deletion and restored-volume cleanup contracts.
+
 ## Volume ownership during create
 
 Warm and cold API creates assign their final sandbox ID before reserving volume
@@ -126,8 +156,20 @@ failure, it drops the original orchestrator and opens the same state in a fresh
 one; cleanup finishes even though an owned restored volume was already deleted.
 Removing the stop-proof guard reproduces premature reservation release.
 
-Native disk contents, VM/ublk stop, pre-launch preparation recovery, and crashes
-while publishing/releasing volumes still require acceptance and reconciliation
-work. Snapshot-volume creation precedes mount reservation; a process loss in
-that preparation window is not covered by the new cleanup record. These local
-tests do not qualify mounted-volume recovery on the deployment host.
+The preparation process test kills the child with SIGKILL immediately after
+volume creation, before any later reserve or VM launch, then opens a fresh
+manager on the same real POSIX catalog and verifies the original owner survives.
+The reservation tests change readiness after an earlier ready read and exercise
+the authoritative catalog operation for both modes and existing/new owners.
+Substituting the actual preceding record initialization and reservation methods
+fails both assertions. API helper tests cover invalid layouts before catalog
+writes, partial child creation, filesystem failure during materialization, and
+preservation of another read-only owner during cleanup.
+
+Native disk contents, VM/ublk stop, complete preparation phase recovery, and
+crashes while publishing/releasing volumes still require acceptance and
+reconciliation work. These local tests do not qualify mounted-volume recovery
+on the deployment host. A separate observed gap remains in `VolumeManager::delete`:
+it removes the catalog record before local backing-directory cleanup and logs
+rather than propagates a filesystem removal failure. Durable volume deletion
+must retain cleanup evidence before that behavior can be qualified.

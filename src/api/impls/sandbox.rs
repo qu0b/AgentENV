@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
@@ -178,10 +179,20 @@ async fn cleanup_fork_volume_children(
     }
 }
 
-async fn cleanup_volume_ids(manager: &VolumeManager, volume_ids: &[String]) {
+/// This path runs only before VM launch. Release only this attempt's owner;
+/// repository deletion still refuses any other live owner.
+async fn cleanup_unlaunched_volumes(
+    manager: &VolumeManager,
+    sandbox_id: SandboxId,
+    volume_ids: &[String],
+) -> Result<(), crate::volume::VolumeError> {
+    manager
+        .replace_owner_for(&sandbox_id.to_string(), None, volume_ids)
+        .await?;
     for volume_id in volume_ids {
-        let _ = manager.delete(volume_id).await;
+        manager.delete(volume_id).await?;
     }
+    Ok(())
 }
 
 async fn prepare_volume_fork_specs(
@@ -286,33 +297,50 @@ async fn snapshot_sandbox_volumes(
 }
 
 async fn restore_snapshot_volume_mounts(
-    api: &ApiImpl,
-    snapshot: &crate::snapshot::RunnableSnapshot,
+    manager: &VolumeManager,
+    snapshots: &[SnapshotVolume],
+    sandbox_id: SandboxId,
 ) -> Result<(HashMap<String, String>, Vec<String>), models::Error> {
+    if snapshots.len() > manager.limits().max_mounts {
+        return Err(ApiImpl::error(
+            400,
+            "snapshot contains too many volume mounts",
+        ));
+    }
+    // Validate the full mount layout before creating any durable children.
+    // Inserting duplicate normalized paths into a map would otherwise lose
+    // the first child's mount while leaving its volume reserved forever.
+    let mut mount_paths: Vec<PathBuf> = Vec::with_capacity(snapshots.len());
+    for snapshot in snapshots {
+        let path = normalize_mount_path(snapshot.mount_path.clone().into())
+            .map_err(|error| ApiImpl::error(400, error.to_string()))?;
+        if mount_paths
+            .iter()
+            .any(|existing| existing.starts_with(&path) || path.starts_with(existing))
+        {
+            return Err(ApiImpl::error(400, "snapshot volume mount paths overlap"));
+        }
+        mount_paths.push(path);
+    }
     let mut mounts = HashMap::new();
-    let mut volume_ids = Vec::with_capacity(snapshot.committed().volume_snapshots.len());
-    for volume_snapshot in &snapshot.committed().volume_snapshots {
-        let mount_path = match normalize_mount_path(volume_snapshot.mount_path.clone().into()) {
-            Ok(path) => path,
-            Err(error) => {
-                cleanup_volume_ids(&api.volume_manager, &volume_ids).await;
-                return Err(ApiImpl::error(400, error.to_string()));
-            }
-        };
+    let mut volume_ids = Vec::with_capacity(snapshots.len());
+    for (snapshot, mount_path) in snapshots.iter().zip(mount_paths) {
         let name = format!("volume-restore-{}", Uuid::now_v7().simple());
-        let child = match api
-            .volume_manager
+        let child = match manager
             .create_from_snapshot(
                 name,
-                volume_snapshot.mode,
-                volume_snapshot.size_mb,
-                volume_snapshot.layers.clone(),
+                snapshot.mode,
+                snapshot.size_mb,
+                snapshot.layers.clone(),
+                Some(sandbox_id),
             )
             .await
         {
             Ok(child) => child,
             Err(error) => {
-                cleanup_volume_ids(&api.volume_manager, &volume_ids).await;
+                cleanup_unlaunched_volumes(manager, sandbox_id, &volume_ids)
+                    .await
+                    .map_err(|error| volume_error_response(error).1)?;
                 return Err(volume_error_response(error).1);
             }
         };
@@ -562,7 +590,13 @@ impl ApiImpl {
         let (requested_volume_mounts, restored_volume_ids) = if body.volume_mounts.is_some() {
             (body.volume_mounts.clone(), Vec::new())
         } else {
-            match restore_snapshot_volume_mounts(self, &snapshot).await {
+            match restore_snapshot_volume_mounts(
+                &self.volume_manager,
+                &snapshot.committed().volume_snapshots,
+                sandbox_id,
+            )
+            .await
+            {
                 Ok((mounts, volume_ids)) => ((!mounts.is_empty()).then_some(mounts), volume_ids),
                 Err(error) => {
                     return Ok(match error.code {
@@ -586,7 +620,17 @@ impl ApiImpl {
         {
             Ok(prepared) => prepared,
             Err(error) => {
-                cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
+                if let Err(cleanup_error) = cleanup_unlaunched_volumes(
+                    &self.volume_manager,
+                    sandbox_id,
+                    &restored_volume_ids,
+                )
+                .await
+                {
+                    return Ok(SandboxesPostResponse::Status500_ServerError(
+                        volume_error_response(cleanup_error).1,
+                    ));
+                }
                 return Ok(match error.code {
                     500.. => SandboxesPostResponse::Status500_ServerError(error),
                     409 => SandboxesPostResponse::Status409_Conflict(error),
@@ -2125,6 +2169,158 @@ impl Sandboxes<()> for ApiImpl {
 mod tests {
     use super::*;
 
+    async fn preparation_volume_manager(root: &std::path::Path) -> anyhow::Result<VolumeManager> {
+        use crate::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
+        let backend = PosixFsBackend::new(PosixFsBackendConfig {
+            root: root.join("repository"),
+            cache_root: Some(root.join("cache")),
+            runtime_cache_root: Some(root.join("runtime")),
+        })?;
+        VolumeManager::open_with_repository(root.join("volumes/catalog"), backend.repository())
+            .await
+    }
+
+    fn preparation_snapshot(path: &str, mode: crate::volume::VolumeMode) -> SnapshotVolume {
+        SnapshotVolume {
+            mount_path: path.into(),
+            mode,
+            size_mb: 64,
+            layers: vec![crate::snapshot::OverlaybdLayerRef::External(
+                crate::snapshot::ExternalLayer {
+                    digest: format!("sha256:{}", "a".repeat(64)),
+                    size: 4096,
+                    repo_blob_url: "https://preparation-fixture.invalid/blobs/".into(),
+                },
+            )],
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_volume_layout_is_validated_before_any_catalog_write() -> anyhow::Result<()> {
+        use crate::volume::VolumeMode;
+        for paths in [
+            ["/data", "/data"],
+            ["/data", "/data/"],
+            ["/data", "/data/nested"],
+        ] {
+            let root = tempfile::tempdir()?;
+            let manager = preparation_volume_manager(root.path()).await?;
+            let snapshots = paths.map(|path| preparation_snapshot(path, VolumeMode::Exclusive));
+            let error = restore_snapshot_volume_mounts(&manager, &snapshots, SandboxId::new())
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, 400);
+            assert!(manager.list_page(None, 10).await?.records.is_empty());
+            assert!(
+                !root.path().join("repository/volumes").exists(),
+                "invalid layout must not create even catalog lock or alias files"
+            );
+        }
+        let root = tempfile::tempdir()?;
+        let manager = preparation_volume_manager(root.path()).await?;
+        let oversized = (0..=manager.limits().max_mounts)
+            .map(|i| preparation_snapshot(&format!("/mount-{i}"), VolumeMode::Exclusive))
+            .collect::<Vec<_>>();
+        assert!(
+            restore_snapshot_volume_mounts(&manager, &oversized, SandboxId::new())
+                .await
+                .is_err()
+        );
+        assert!(!root.path().join("repository/volumes").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_volume_preparation_cleans_only_its_original_owned_children(
+    ) -> anyhow::Result<()> {
+        use crate::volume::{VolumeError, VolumeMode};
+        let root = tempfile::tempdir()?;
+        let manager = preparation_volume_manager(root.path()).await?;
+        let owner = SandboxId::new();
+        let mut snapshots = vec![
+            preparation_snapshot("/data", VolumeMode::Exclusive),
+            preparation_snapshot("/database", VolumeMode::ReadOnly),
+        ];
+        snapshots[1].size_mb = 0;
+        assert!(restore_snapshot_volume_mounts(&manager, &snapshots, owner)
+            .await
+            .is_err());
+        assert!(
+            manager.list_page(None, 10).await?.records.is_empty(),
+            "a later preparation failure must clean the earlier owned child"
+        );
+        snapshots[1].size_mb = 64;
+        let (mounts, ids) = restore_snapshot_volume_mounts(&manager, &snapshots, owner)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.message))?;
+        assert_eq!(
+            mounts.len(),
+            2,
+            "distinct path components must not be mistaken for overlap"
+        );
+        for id in &ids {
+            assert!(manager.get(id).await?.mounted_by(&owner.to_string()));
+        }
+        let prepared = prepare_volume_mounts(&manager, Some(&mounts), owner)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.message))?;
+        assert_eq!(prepared.volume_ids.len(), 2);
+        let shared = mounts.get("/database").unwrap();
+        manager.reserve(shared, "other-reader").await?;
+        let error = cleanup_unlaunched_volumes(&manager, owner, &ids)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, VolumeError::Reserved(_)));
+        let remaining = manager.get(shared).await?;
+        assert!(!remaining.mounted_by(&owner.to_string()));
+        assert!(remaining.mounted_by("other-reader"));
+        assert!(matches!(
+            manager.get(mounts.get("/data").unwrap()).await,
+            Err(VolumeError::NotFound(_))
+        ));
+        manager
+            .replace_owner_for("other-reader", None, std::slice::from_ref(shared))
+            .await?;
+        manager.delete(shared).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mount_resolution_failure_releases_all_preowned_restored_volumes() -> anyhow::Result<()>
+    {
+        use crate::volume::VolumeMode;
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir()?;
+        let manager = preparation_volume_manager(root.path()).await?;
+        let owner = SandboxId::new();
+        let snapshots = vec![
+            preparation_snapshot("/data", VolumeMode::Exclusive),
+            preparation_snapshot("/other", VolumeMode::Exclusive),
+        ];
+        let (mounts, ids) = restore_snapshot_volume_mounts(&manager, &snapshots, owner)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.message))?;
+        let blocked = manager.data_dir(mounts.get("/data").unwrap());
+        std::fs::create_dir_all(&blocked)?;
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o500))?;
+        let result = prepare_volume_mounts(&manager, Some(&mounts), owner).await;
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700))?;
+        assert!(
+            result.is_err(),
+            "filesystem failure must stop mount materialization"
+        );
+        assert!(
+            manager
+                .get(mounts.get("/other").unwrap())
+                .await?
+                .mounted_by(&owner.to_string()),
+            "restored but unvisited mounts still carry their initial owner"
+        );
+        cleanup_unlaunched_volumes(&manager, owner, &ids).await?;
+        assert!(manager.list_page(None, 10).await?.records.is_empty());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn failed_create_keeps_final_volume_owner_until_runtime_cleanup_is_confirmed(
     ) -> anyhow::Result<()> {
@@ -2172,6 +2368,7 @@ mod tests {
                                 size: 4096,
                                 repo_blob_url: "https://volume-fixture.invalid/blobs/".into(),
                             })],
+                            None,
                         )
                         .await?;
                     let restored_ids = if restored {
