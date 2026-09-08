@@ -7164,6 +7164,8 @@ pub enum SandboxState {
     Running,
     #[serde(rename = "paused")]
     Paused,
+    #[serde(rename = "cleanup_pending")]
+    CleanupPending,
 }
 
 impl validator::Validate for SandboxState {
@@ -7177,6 +7179,7 @@ impl std::fmt::Display for SandboxState {
         match *self {
             SandboxState::Running => write!(f, "running"),
             SandboxState::Paused => write!(f, "paused"),
+            SandboxState::CleanupPending => write!(f, "cleanup_pending"),
         }
     }
 }
@@ -7188,6 +7191,7 @@ impl std::str::FromStr for SandboxState {
         match s {
             "running" => std::result::Result::Ok(SandboxState::Running),
             "paused" => std::result::Result::Ok(SandboxState::Paused),
+            "cleanup_pending" => std::result::Result::Ok(SandboxState::CleanupPending),
             _ => std::result::Result::Err(format!(r#"Value not valid: {s}"#)),
         }
     }

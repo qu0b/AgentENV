@@ -229,6 +229,7 @@ impl MockBehavior {
     }
 
     fn apply_sync(&self, operation: MockOperation) -> Result<()> {
+        self.run_operation_hook(operation);
         Self::run_sync_action(
             self.pop_action(operation),
             |message| anyhow!(message),

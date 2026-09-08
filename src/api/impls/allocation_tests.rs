@@ -108,11 +108,22 @@ async fn allocation_http_owner_mismatch_never_fences_or_allocates_on_another_nod
 }
 
 async fn app() -> (tempfile::TempDir, Router, String) {
+    app_with_cleanup(None).await
+}
+
+async fn app_with_cleanup(
+    cleanup: Option<crate::orchestrator::SandboxMetadata>,
+) -> (tempfile::TempDir, Router, String) {
+    use crate::orchestrator::SandboxPersister;
     let root = tempfile::tempdir().unwrap();
+    let persister = FileBackedSandboxPersister::new_for_test(root.path().join("sandboxes"));
+    if let Some(metadata) = cleanup {
+        persister.persist_deleting(&metadata).await.unwrap();
+    }
     let orchestrator = Orchestrator::new(
         InMemoryMetadataStore::new(),
         FirecrackerSandboxFactory::new(),
-        FileBackedSandboxPersister::new_for_test(root.path().join("sandboxes")),
+        persister,
     )
     .await
     .unwrap();
@@ -143,6 +154,72 @@ async fn app() -> (tempfile::TempDir, Router, String) {
         .owner_id()
         .to_string();
     (root, server::new(api), owner)
+}
+
+#[tokio::test]
+async fn cleanup_http_lists_debt_without_connecting_and_acknowledges_only_proven_deletion() {
+    use crate::orchestrator::{SandboxMetadata, SandboxState};
+    for stopped in [false, true] {
+        let metadata = SandboxMetadata {
+            state: SandboxState::CleanupPending,
+            runtime_stopped: stopped,
+            ..Default::default()
+        };
+        let id = metadata.id.to_string();
+        let (_root, app, _) = app_with_cleanup(Some(metadata)).await;
+        let headers = [("x-api-key", KEY)];
+        let list = request(&app, "GET", "/v2/sandboxes", None, &headers).await;
+        assert_eq!(list.0, StatusCode::OK);
+        assert_eq!(list.1[0]["sandboxID"], id);
+        assert_eq!(list.1[0]["state"], "cleanup_pending");
+        assert_eq!(
+            request(
+                &app,
+                "GET",
+                "/v2/sandboxes?state=running&state=paused",
+                None,
+                &headers
+            )
+            .await
+            .1,
+            json!([])
+        );
+        let path = format!("/sandboxes/{id}");
+        assert_eq!(
+            request(
+                &app,
+                "POST",
+                &format!("{path}/connect"),
+                Some(json!({"timeout":60})),
+                &headers
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            request(&app, "DELETE", &path, None, &[]).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            request(&app, "DELETE", &path, None, &headers).await.0,
+            if stopped {
+                StatusCode::NO_CONTENT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        );
+        let remaining = request(
+            &app,
+            "GET",
+            "/v2/sandboxes?state=cleanup_pending",
+            None,
+            &headers,
+        )
+        .await;
+        assert_eq!(remaining.0, StatusCode::OK);
+        assert_eq!(remaining.1.as_array().unwrap().len(), usize::from(!stopped));
+    }
 }
 
 async fn request(

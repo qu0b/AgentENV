@@ -61,6 +61,10 @@ pub struct SandboxMetadata {
     /// Older records deserialize as non-secure sandboxes.
     #[serde(default)]
     pub secure: bool,
+    /// Durable confirmation that the prior backend stopped. Neither a paused
+    /// snapshot nor a missing process-local handle establishes this proof.
+    #[serde(default)]
+    pub runtime_stopped: bool,
     /// Paused state produced by the sandbox backend during `pause`.
     /// Passed back to the backend factory when `resume_sandbox` is called.
     #[serde(skip)]
@@ -95,6 +99,7 @@ impl Default for SandboxMetadata {
             custom_extension_params: None,
             volume_mounts: HashMap::new(),
             secure: false,
+            runtime_stopped: false,
             paused_state: None,
         }
     }

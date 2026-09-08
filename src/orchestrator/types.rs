@@ -81,6 +81,8 @@ pub enum SandboxState {
     Pausing,
     Paused,
     Killing,
+    /// Deletion was accepted but cleanup has not been durably confirmed.
+    CleanupPending,
 }
 
 impl Display for SandboxState {
@@ -94,6 +96,7 @@ impl Display for SandboxState {
             SandboxState::Pausing => "pausing",
             SandboxState::Paused => "paused",
             SandboxState::Killing => "killing",
+            SandboxState::CleanupPending => "cleanup_pending",
         };
         write!(f, "{s}")
     }

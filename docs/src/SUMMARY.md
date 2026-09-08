@@ -57,6 +57,7 @@
 - [Sandbox Network Architecture](./internals/networking.md)
 - [Sandbox Internals and Testing](./internals/sandbox-testing.md)
 - [Template Builder and Testing](./internals/template-builder-testing.md)
+- [Sandbox Stop Confirmation and Cleanup](./internals/sandbox-cleanup.md)
 - [Persistence Artifact Inventory](./internals/persistence-artifact-inventory.md)
 - [Proxy Design](./internals/proxy-design.md)
 - [Distributed Control Plane](./internals/services.md)

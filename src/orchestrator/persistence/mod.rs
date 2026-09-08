@@ -89,6 +89,13 @@ pub trait SandboxPersister: Send + Sync {
     /// Roll back a resuming mark after a failed resume attempt.
     async fn rollback_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()>;
 
+    /// Persist a deletion tombstone before stopping the runtime or removing
+    /// snapshot artifacts. Repeated writes retain the original cleanup identity.
+    async fn persist_deleting(&self, metadata: &SandboxMetadata) -> PersistenceResult<()>;
+
+    /// Confirm backend stop without changing the original snapshot or identity.
+    async fn confirm_runtime_stopped(&self, sandbox_id: &SandboxId) -> PersistenceResult<()>;
+
     /// Delete the persistence record for a sandbox.
     async fn delete_record(&self, sandbox_id: &SandboxId) -> PersistenceResult<()>;
 
@@ -129,6 +136,14 @@ impl SandboxPersister for DisabledSandboxPersister {
     }
 
     async fn rollback_resuming(&self, _sandbox_id: &SandboxId) -> PersistenceResult<()> {
+        Ok(())
+    }
+
+    async fn persist_deleting(&self, _metadata: &SandboxMetadata) -> PersistenceResult<()> {
+        Ok(())
+    }
+
+    async fn confirm_runtime_stopped(&self, _sandbox_id: &SandboxId) -> PersistenceResult<()> {
         Ok(())
     }
 

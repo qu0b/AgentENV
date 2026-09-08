@@ -24,6 +24,7 @@ const RECORD_DB_DIR: &str = "records.db";
 enum PersistedPausedLifecycle {
     Paused,
     Resuming,
+    Deleting,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -288,9 +289,24 @@ impl SandboxPersister for FileBackedSandboxPersister {
             };
             let sandbox_id = record.metadata.id;
 
+            if record.lifecycle == PersistedPausedLifecycle::Deleting {
+                retained_artifacts.insert(sandbox_id);
+                let mut metadata = record.metadata;
+                metadata.state = SandboxState::CleanupPending;
+                metadata.paused_state = None;
+                sandboxes.push(metadata);
+                continue;
+            }
+
             if record.lifecycle == PersistedPausedLifecycle::Resuming {
-                warn!(sandbox_id = %sandbox_id, "discarding paused sandbox record left in resuming state");
-                self.cleanup_invalid_record(&sandbox_id).await?;
+                warn!(sandbox_id = %sandbox_id, "retaining interrupted resume for native reconciliation");
+                retained_artifacts.insert(sandbox_id);
+                let mut metadata = record.metadata;
+                metadata.state = SandboxState::CleanupPending;
+                // Any earlier stop proof belongs to the pre-resume runtime.
+                metadata.runtime_stopped = false;
+                metadata.paused_state = None;
+                sandboxes.push(metadata);
                 continue;
             }
 
@@ -395,6 +411,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
         debug!(sandbox_id = %sandbox_id, "rolling back paused sandbox to paused");
         let mut record = self.get_record(sandbox_id).await?;
         record.lifecycle = PersistedPausedLifecycle::Paused;
+        record.metadata.runtime_stopped = false;
         self.put_record(&record).await
     }
 
@@ -403,10 +420,40 @@ impl SandboxPersister for FileBackedSandboxPersister {
         self.remove_record(sandbox_id).await
     }
 
+    async fn persist_deleting(&self, metadata: &SandboxMetadata) -> PersistenceResult<()> {
+        // The artifact path is derived from the original ID, never supplied by
+        // a cleanup caller. No resumable backend state belongs in a tombstone.
+        let mut metadata = metadata.clone();
+        metadata.state = SandboxState::CleanupPending;
+        metadata.paused_state = None;
+        self.put_record(&PersistedPausedRecord {
+            version: RECORD_VERSION,
+            lifecycle: PersistedPausedLifecycle::Deleting,
+            artifact_root: self.sandbox_artifact_root(&metadata.id),
+            metadata,
+            state: Value::Null,
+        })
+        .await
+    }
+
+    async fn confirm_runtime_stopped(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
+        let mut record = self.get_record(sandbox_id).await?;
+        if record.lifecycle == PersistedPausedLifecycle::Resuming {
+            return Err(SandboxPersistenceError::InvalidRecord {
+                reason: "cannot confirm stop for a resuming record".to_string(),
+                source: None,
+            });
+        }
+        record.metadata.runtime_stopped = true;
+        self.put_record(&record).await
+    }
+
     async fn delete_record_and_artifacts(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
         debug!(sandbox_id = %sandbox_id, "deleting paused sandbox record and artifacts");
-        self.remove_record(sandbox_id).await?;
         Self::remove_artifact_root(&self.sandbox_artifact_root(sandbox_id)).await?;
+        // Keep the tombstone while filesystem cleanup is incomplete. A crash
+        // between these operations must reload cleanup, never a paused VM.
+        self.remove_record(sandbox_id).await?;
         Ok(())
     }
 }
@@ -640,7 +687,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resuming_records_are_cleaned_on_load() -> anyhow::Result<()> {
+    async fn resuming_records_keep_reconciliation_evidence_without_reusing_old_stop_proof(
+    ) -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
         let sandbox_id = SandboxId::new();
@@ -657,13 +705,21 @@ mod tests {
         persister
             .persist_paused(&metadata, Some(&snapshot_root), paused_state.as_ref())
             .await?;
+        persister.confirm_runtime_stopped(&metadata.id).await?;
         persister.mark_resuming(&metadata.id).await?;
+        assert!(persister
+            .confirm_runtime_stopped(&metadata.id)
+            .await
+            .is_err());
 
         let loaded = persister.load_all(&MockBackendFactory::new()).await?;
 
-        assert!(loaded.is_empty());
-        assert!(!has_record(&persister, &metadata.id).await?);
-        assert!(!persister.sandbox_artifact_root(&metadata.id).exists());
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].state, SandboxState::CleanupPending);
+        assert!(!loaded[0].runtime_stopped);
+        assert!(loaded[0].paused_state.is_none());
+        assert!(has_record(&persister, &metadata.id).await?);
+        assert!(persister.sandbox_artifact_root(&metadata.id).exists());
         Ok(())
     }
 

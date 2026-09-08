@@ -833,6 +833,7 @@ fn paused_resume_metadata(sandbox_id: SandboxId) -> SandboxMetadata {
     SandboxMetadata {
         id: sandbox_id,
         state: SandboxState::Paused,
+        runtime_stopped: true,
         paused_state: Some(test_paused_state().clone()),
         ..Default::default()
     }
@@ -999,7 +1000,7 @@ async fn proxy_lookup_reports_paused_for_paused_sandbox() {
 }
 
 #[tokio::test]
-async fn cleanup_failed_launch_removes_created_running_metadata() {
+async fn cleanup_failed_launch_removes_created_transitional_metadata() {
     let orchestrator = make_orchestrator().await;
     let sandbox_id = SandboxId::new();
     let plan = create_launch_plan_with_resources(sandbox_id);
@@ -1011,14 +1012,14 @@ async fn cleanup_failed_launch_removes_created_running_metadata() {
         .store
         .add(SandboxMetadata {
             id: sandbox_id,
-            state: SandboxState::Running,
+            state: SandboxState::Creating,
             ..Default::default()
         })
         .await
         .unwrap();
 
     orchestrator
-        .cleanup_failed_launch(&plan, handle, FailedLaunchStage::RunningPersisted)
+        .cleanup_failed_launch(&plan, handle, FailedLaunchStage::TransitionalPersisted)
         .await;
 
     assert!(orchestrator.store.get(&sandbox_id).await.unwrap().is_none());
@@ -1030,7 +1031,7 @@ async fn cleanup_failed_launch_restores_resume_metadata() {
     let sandbox_id = SandboxId::new();
     let rollback_metadata = paused_resume_metadata(sandbox_id);
     let mut running_metadata = rollback_metadata.clone();
-    running_metadata.state = SandboxState::Running;
+    running_metadata.state = SandboxState::Resuming;
     let plan = resume_launch_plan(sandbox_id);
     let handle: SandboxHandle = Arc::new(Mutex::new(Box::new(MockSandboxBackend::new(Arc::new(
         MockBehavior::new(),
@@ -1039,7 +1040,7 @@ async fn cleanup_failed_launch_restores_resume_metadata() {
     orchestrator.store.add(running_metadata).await.unwrap();
 
     orchestrator
-        .cleanup_failed_launch(&plan, handle, FailedLaunchStage::RunningPersisted)
+        .cleanup_failed_launch(&plan, handle, FailedLaunchStage::TransitionalPersisted)
         .await;
 
     assert_eq!(
@@ -1119,7 +1120,11 @@ async fn cleanup_failed_launch_does_not_remove_replacement_runtime_state() {
         .await;
 
     orchestrator
-        .cleanup_failed_launch(&plan, stale_handle, FailedLaunchStage::RunningPersisted)
+        .cleanup_failed_launch(
+            &plan,
+            stale_handle,
+            FailedLaunchStage::TransitionalPersisted,
+        )
         .await;
 
     let current_handle = orchestrator
@@ -1679,7 +1684,8 @@ async fn pause_resume_transitions_and_is_idempotent() -> Result<()> {
 }
 
 #[tokio::test]
-async fn pause_succeeds_and_releases_metrics_even_when_stop_fails_after_snapshot() -> Result<()> {
+async fn pause_requires_confirmed_stop_and_retries_the_same_backend_before_releasing_capacity(
+) -> Result<()> {
     setup();
     let behavior = Arc::new(MockBehavior::new());
     behavior.push_action(
@@ -1694,7 +1700,7 @@ async fn pause_succeeds_and_releases_metrics_even_when_stop_fails_after_snapshot
         .create_sandbox(create_request(Some(60), &[]))
         .await?;
 
-    orchestrator.pause_sandbox(created.id).await?;
+    assert!(orchestrator.pause_sandbox(created.id).await.is_err());
 
     let paused = orchestrator
         .get_sandbox(&created.id)
@@ -1702,10 +1708,32 @@ async fn pause_succeeds_and_releases_metrics_even_when_stop_fails_after_snapshot
         .expect("sandbox should still exist after pause");
     assert_eq!(paused.state, SandboxState::Paused);
 
-    // Resource metrics are derived from the current metadata state, so a
-    // sandbox that is logically Paused no longer counts toward allocated
-    // CPU/memory regardless of whether the backing VM `stop()` succeeded.
+    assert!(!paused.runtime_stopped);
+    assert!(orchestrator
+        .sandboxes
+        .read()
+        .await
+        .contains_key(&created.id));
+    assert_metrics_values(
+        &orchestrator,
+        1,
+        0,
+        1,
+        0,
+        created.resources.cpu_count,
+        created.resources.memory_mib,
+    )
+    .await;
+    orchestrator.pause_sandbox(created.id).await?;
+    assert!(
+        orchestrator
+            .get_sandbox(&created.id)
+            .await?
+            .unwrap()
+            .runtime_stopped
+    );
     assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
+    orchestrator.delete_sandbox(created.id).await?;
     Ok(())
 }
 
@@ -1809,7 +1837,8 @@ async fn pause_persists_before_publishing_paused_metadata() -> Result<()> {
         persister.calls(),
         vec![
             RecordingCall::AllocateArtifactRoot,
-            RecordingCall::PersistPaused
+            RecordingCall::PersistPaused,
+            RecordingCall::ConfirmRuntimeStopped
         ]
     );
     let metadata = orchestrator
@@ -1964,6 +1993,7 @@ async fn pause_artifact_root_allocation_failure_restores_running_for_retry() -> 
             RecordingCall::AllocateArtifactRoot,
             RecordingCall::AllocateArtifactRoot,
             RecordingCall::PersistPaused,
+            RecordingCall::ConfirmRuntimeStopped,
         ]
     );
 
@@ -2224,6 +2254,7 @@ async fn resume_sandbox_build_failure_does_not_subtract_metrics_that_were_never_
         .add(SandboxMetadata {
             id: paused_id,
             state: SandboxState::Paused,
+            runtime_stopped: true,
             paused_state: Some(test_paused_state().clone()),
             ..Default::default()
         })
@@ -3340,6 +3371,9 @@ async fn orchestrator_delete_paused_sandbox_removes_metadata() -> Result<()> {
         vec![
             RecordingCall::AllocateArtifactRoot,
             RecordingCall::PersistPaused,
+            RecordingCall::ConfirmRuntimeStopped,
+            RecordingCall::PersistDeleting,
+            RecordingCall::PersistDeleting,
             RecordingCall::DeleteRecordAndArtifacts
         ]
     );
@@ -3638,6 +3672,176 @@ async fn concurrent_resume_when_leader_build_fails_is_consistent() -> anyhow::Re
 }
 
 #[tokio::test]
+async fn failed_create_retains_unstopped_runtime_until_delete_confirms_cleanup() -> Result<()> {
+    for operation in [MockOperation::StartNowait, MockOperation::WaitForReady] {
+        let behavior = Arc::new(MockBehavior::new());
+        let persister = RecordingPersister::default();
+        let mut orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+            InMemoryMetadataStore::new(),
+            MockBackendFactory::with_behavior(behavior.clone()),
+            persister.clone(),
+        );
+        let image_refs = Arc::new(RecordingRuntimeImageRefs::default());
+        Arc::get_mut(&mut orchestrator).unwrap().image_refs = image_refs.clone();
+        behavior.push_action(
+            operation,
+            MockAction::Fail {
+                message: "launch failed".into(),
+            },
+        );
+        for _ in 0..2 {
+            behavior.push_action(
+                MockOperation::Stop,
+                MockAction::Fail {
+                    message: "runtime still alive".into(),
+                },
+            );
+        }
+        assert!(orchestrator
+            .create_sandbox(create_request(Some(60), &[]))
+            .await
+            .is_err());
+        let inventory = orchestrator.store.list().await?;
+        assert_eq!(inventory.len(), 1);
+        let pending = &inventory[0];
+        assert_eq!(pending.state, SandboxState::CleanupPending);
+        assert!(!pending.runtime_stopped);
+        assert!(persister.calls().contains(&RecordingCall::PersistDeleting));
+        let retained = orchestrator
+            .sandboxes
+            .read()
+            .await
+            .get(&pending.id)
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            current_metrics(&orchestrator).await.allocated_cpu,
+            pending.resources.cpu_count
+        );
+        let releases = image_refs.unpinned();
+        if operation == MockOperation::StartNowait {
+            assert!(
+                releases.is_empty(),
+                "failed early stop must retain startup protection"
+            );
+        }
+        assert!(orchestrator.delete_sandbox(pending.id).await.is_err());
+        assert_eq!(image_refs.unpinned(), releases);
+        assert!(Arc::ptr_eq(
+            &retained,
+            orchestrator
+                .sandboxes
+                .read()
+                .await
+                .get(&pending.id)
+                .unwrap()
+        ));
+        assert!(
+            !orchestrator
+                .get_sandbox(&pending.id)
+                .await?
+                .unwrap()
+                .runtime_stopped
+        );
+        orchestrator.delete_sandbox(pending.id).await?;
+        assert_eq!(behavior.stop_calls(), 3);
+        assert!(image_refs.unpinned()[releases.len()..]
+            .contains(&RuntimeImageOwner::StartingSandbox(pending.id)));
+        assert!(orchestrator.get_sandbox(&pending.id).await?.is_none());
+        assert_eq!(current_metrics(&orchestrator).await.allocated_cpu, 0);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_resume_must_stop_original_attempt_before_building_another_runtime() -> Result<()> {
+    for operation in [MockOperation::StartNowait, MockOperation::WaitForReady] {
+        let behavior = Arc::new(MockBehavior::new());
+        let persister = RecordingPersister::default();
+        let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+            InMemoryMetadataStore::new(),
+            MockBackendFactory::with_behavior(behavior.clone()),
+            persister.clone(),
+        );
+        let created = orchestrator
+            .create_sandbox(create_request(Some(60), &[]))
+            .await?;
+        orchestrator.pause_sandbox(created.id).await?;
+        let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = builds.clone();
+        behavior.set_on_operation(
+            MockOperation::BuildFromSnapshot,
+            Arc::new(move || {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }),
+        );
+        behavior.push_action(
+            operation,
+            MockAction::Fail {
+                message: "resume failed".into(),
+            },
+        );
+        for _ in 0..2 {
+            behavior.push_action(
+                MockOperation::Stop,
+                MockAction::Fail {
+                    message: "runtime still alive".into(),
+                },
+            );
+        }
+        persister.clear_calls();
+        assert!(orchestrator
+            .resume_sandbox(created.id, NewTimeout::UseExisting)
+            .await
+            .is_err());
+        let pending = orchestrator.get_sandbox(&created.id).await?.unwrap();
+        assert_eq!(pending.state, SandboxState::Paused);
+        assert!(!pending.runtime_stopped);
+        assert_eq!(
+            persister.calls(),
+            vec![RecordingCall::MarkResuming, RecordingCall::RollbackResuming]
+        );
+        let retained = orchestrator
+            .sandboxes
+            .read()
+            .await
+            .get(&created.id)
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            current_metrics(&orchestrator).await.allocated_cpu,
+            created.resources.cpu_count
+        );
+        assert!(orchestrator
+            .resume_sandbox(created.id, NewTimeout::UseExisting)
+            .await
+            .is_err());
+        assert!(Arc::ptr_eq(
+            &retained,
+            orchestrator
+                .sandboxes
+                .read()
+                .await
+                .get(&created.id)
+                .unwrap()
+        ));
+        assert_eq!(builds.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let resumed = orchestrator
+            .resume_sandbox(created.id, NewTimeout::UseExisting)
+            .await?;
+        assert_eq!(resumed.state, SandboxState::Running);
+        assert!(
+            !resumed.runtime_stopped,
+            "previous stop proof does not apply to the new runtime"
+        );
+        assert_eq!(builds.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(behavior.stop_calls(), 4);
+        orchestrator.delete_sandbox(created.id).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn resume_sandbox_start_failure_from_launch_rolls_back_to_paused_and_allows_retry(
 ) -> Result<()> {
     setup();
@@ -3804,7 +4008,11 @@ async fn resume_marks_resuming_and_deletes_record_after_success() -> Result<()> 
     orchestrator.delete_sandbox(created.id).await?;
     assert_eq!(
         persister.calls(),
-        vec![RecordingCall::DeleteRecordAndArtifacts]
+        vec![
+            RecordingCall::PersistDeleting,
+            RecordingCall::PersistDeleting,
+            RecordingCall::DeleteRecordAndArtifacts
+        ]
     );
     Ok(())
 }
@@ -3879,7 +4087,11 @@ async fn resume_launch_failure_rolls_back_resuming_record() -> Result<()> {
     ));
     assert_eq!(
         persister.calls(),
-        vec![RecordingCall::MarkResuming, RecordingCall::RollbackResuming]
+        vec![
+            RecordingCall::MarkResuming,
+            RecordingCall::RollbackResuming,
+            RecordingCall::ConfirmRuntimeStopped
+        ]
     );
     let metadata = orchestrator
         .get_sandbox(&created.id)
@@ -3937,10 +4149,300 @@ async fn delete_when_stop_fails_returns_error_and_allows_retry() -> Result<()> {
         "metadata should still exist after failed delete"
     );
     assert_metrics_snapshot(&orchestrator, &running_metrics).await;
+    assert_eq!(
+        orchestrator.get_sandbox(&sandbox_id).await?.unwrap().state,
+        SandboxState::CleanupPending
+    );
+    assert_eq!(
+        orchestrator.proxy_lookup_for(&sandbox_id).await?,
+        ProxyLookupResult::Unavailable(SandboxState::CleanupPending)
+    );
+    assert!(orchestrator
+        .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
+        .await
+        .is_err());
 
     orchestrator.delete_sandbox(sandbox_id).await?;
     assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
     assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn deletion_persistence_failure_keeps_cleanup_retryable_without_resume() -> Result<()> {
+    for paused in [false, true] {
+        for failure in [
+            RecordingCall::DeleteRecordAndArtifacts,
+            RecordingCall::PersistDeleting,
+        ] {
+            let persister = RecordingPersister::default();
+            let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+                InMemoryMetadataStore::new(),
+                MockBackendFactory::new(),
+                persister.clone(),
+            );
+            let created = orchestrator
+                .create_sandbox(create_request(Some(60), &[]))
+                .await?;
+            if paused {
+                orchestrator.pause_sandbox(created.id).await?;
+            }
+            persister.clear_calls();
+            persister.fail_next(failure);
+            assert!(orchestrator.delete_sandbox(created.id).await.is_err());
+            let pending = orchestrator
+                .get_sandbox(&created.id)
+                .await?
+                .expect("cleanup identity retained");
+            assert_eq!(pending.state, SandboxState::CleanupPending);
+            assert_eq!(
+                orchestrator.proxy_lookup_for(&created.id).await?,
+                ProxyLookupResult::Unavailable(SandboxState::CleanupPending)
+            );
+            assert!(orchestrator
+                .resume_sandbox(created.id, NewTimeout::UseExisting)
+                .await
+                .is_err());
+            orchestrator.delete_sandbox(created.id).await?;
+            assert!(orchestrator.get_sandbox(&created.id).await?.is_none());
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn deletion_runtime_without_stop_proof_is_not_absence_after_restart() -> Result<()> {
+    let metadata = SandboxMetadata {
+        state: SandboxState::CleanupPending,
+        ..Default::default()
+    };
+    let id = metadata.id;
+    let persister = RecordingPersister::with_loaded(vec![metadata]);
+    let orchestrator = Orchestrator::new_inner(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+        test_runtime_image_refs(),
+    )
+    .await?;
+    assert!(orchestrator
+        .delete_sandbox(id)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("unconfirmed"));
+    assert!(orchestrator.get_sandbox(&id).await?.is_some());
+    assert!(!persister
+        .calls()
+        .contains(&RecordingCall::DeleteRecordAndArtifacts));
+    assert!(orchestrator
+        .resume_sandbox(id, NewTimeout::UseExisting)
+        .await
+        .is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn pause_stop_confirmation_failure_retries_without_recapturing_or_reusing_old_runtime_proof(
+) -> Result<()> {
+    let persister = RecordingPersister::default();
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+    );
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    persister.fail_next(RecordingCall::ConfirmRuntimeStopped);
+    assert!(orchestrator.pause_sandbox(created.id).await.is_err());
+    assert!(
+        !orchestrator
+            .get_sandbox(&created.id)
+            .await?
+            .unwrap()
+            .runtime_stopped
+    );
+    assert!(orchestrator
+        .sandboxes
+        .read()
+        .await
+        .contains_key(&created.id));
+    orchestrator.pause_sandbox(created.id).await?;
+    assert_eq!(
+        persister.calls(),
+        vec![
+            RecordingCall::AllocateArtifactRoot,
+            RecordingCall::PersistPaused,
+            RecordingCall::ConfirmRuntimeStopped,
+            RecordingCall::ConfirmRuntimeStopped
+        ]
+    );
+    let resumed = orchestrator
+        .resume_sandbox(created.id, NewTimeout::UseExisting)
+        .await?;
+    assert!(
+        !resumed.runtime_stopped,
+        "prior paused VM stop does not confirm the newly resumed runtime stopped"
+    );
+    orchestrator.delete_sandbox(created.id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn paused_snapshot_without_runtime_stop_proof_cannot_resume_on_a_fresh_node() -> Result<()> {
+    let metadata = SandboxMetadata {
+        state: SandboxState::Paused,
+        paused_state: Some(test_paused_state().clone()),
+        ..Default::default()
+    };
+    let id = metadata.id;
+    let persister = RecordingPersister::with_loaded(vec![metadata]);
+    let orchestrator = Orchestrator::new_inner(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+        test_runtime_image_refs(),
+    )
+    .await?;
+    assert!(orchestrator
+        .resume_sandbox(id, NewTimeout::UseExisting)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("unconfirmed"));
+    assert_eq!(
+        orchestrator.get_sandbox(&id).await?.unwrap().state,
+        SandboxState::Paused
+    );
+    assert!(!persister.calls().contains(&RecordingCall::MarkResuming));
+    assert!(orchestrator.delete_sandbox(id).await.is_err());
+    assert!(!persister
+        .calls()
+        .contains(&RecordingCall::DeleteRecordAndArtifacts));
+    Ok(())
+}
+
+#[test]
+fn deletion_process_worker() {
+    let Ok(root) = std::env::var("EU919_DELETE_CHILD_ROOT") else {
+        return;
+    };
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        use super::super::persistence::FileBackedSandboxPersister;
+        use std::os::unix::fs::PermissionsExt;
+        let root = PathBuf::from(root);
+        let persister = FileBackedSandboxPersister::new_for_test(root.join("state"));
+        let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+            InMemoryMetadataStore::new(),
+            MockBackendFactory::new(),
+            persister,
+        );
+        let created = orchestrator
+            .create_sandbox(create_request(Some(60), &[("case", "durable-delete")]))
+            .await
+            .unwrap();
+        orchestrator.pause_sandbox(created.id).await.unwrap();
+        let locked = root
+            .join("state/artifacts")
+            .join(created.id.to_string())
+            .join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("evidence"), b"original paused artifacts").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let error = orchestrator
+            .delete_sandbox(created.id)
+            .await
+            .expect_err("filesystem failure must not acknowledge deletion");
+        assert!(error.to_string().contains("persisted sandbox state"));
+        let pending = orchestrator
+            .get_sandbox(&created.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.state, SandboxState::CleanupPending);
+        assert!(pending.runtime_stopped);
+        std::fs::write(root.join("boundary"), created.id.to_string()).unwrap();
+        std::future::pending::<()>().await;
+    });
+}
+
+#[tokio::test]
+async fn deletion_filesystem_failure_survives_sigkill_and_finishes_on_retry() -> anyhow::Result<()>
+{
+    use super::super::persistence::FileBackedSandboxPersister;
+    use std::os::unix::{fs::PermissionsExt, process::ExitStatusExt};
+    let root = TempDir::new()?;
+    let mut child = std::process::Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "orchestrator::service::tests::deletion_process_worker",
+            "--nocapture",
+        ])
+        .env("EU919_DELETE_CHILD_ROOT", root.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let boundary = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "worker exited before durable deletion boundary"
+            );
+            if let Ok(value) = std::fs::read_to_string(root.path().join("boundary")) {
+                if let Ok(id) = SandboxId::parse_str(&value) {
+                    break id;
+                }
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    child.kill()?;
+    assert_eq!(child.wait()?.signal(), Some(9));
+    let id = boundary.expect("child reached actual filesystem failure");
+    let locked = root
+        .path()
+        .join("state/artifacts")
+        .join(id.to_string())
+        .join("locked");
+    let restarted = Orchestrator::new_inner(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        FileBackedSandboxPersister::new_for_test(root.path().join("state")),
+        test_runtime_image_refs(),
+    )
+    .await?;
+    let pending = restarted
+        .get_sandbox(&id)
+        .await?
+        .expect("durable cleanup debt survives SIGKILL");
+    assert_eq!(pending.state, SandboxState::CleanupPending);
+    assert!(pending.runtime_stopped);
+    assert!(pending.paused_state.is_none());
+    assert_eq!(
+        std::fs::read(locked.join("evidence"))?,
+        b"original paused artifacts"
+    );
+    assert!(restarted
+        .resume_sandbox(id, NewTimeout::UseExisting)
+        .await
+        .is_err());
+    assert_eq!(
+        restarted.proxy_lookup_for(&id).await?,
+        ProxyLookupResult::Unavailable(SandboxState::CleanupPending)
+    );
+    assert!(restarted.delete_sandbox(id).await.is_err());
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700))?;
+    restarted.delete_sandbox(id).await?;
+    assert!(restarted.get_sandbox(&id).await?.is_none());
+    assert!(restarted
+        .persister
+        .load_all(&MockBackendFactory::new())
+        .await?
+        .is_empty());
+    assert!(!locked.parent().unwrap().exists());
+    restarted.shutdown().await?;
     Ok(())
 }
 
@@ -4178,8 +4680,10 @@ async fn shutdown_pauses_running_sandboxes_and_rejects_new_lifecycle_operations(
         vec![
             RecordingCall::AllocateArtifactRoot,
             RecordingCall::PersistPaused,
+            RecordingCall::ConfirmRuntimeStopped,
             RecordingCall::AllocateArtifactRoot,
-            RecordingCall::PersistPaused
+            RecordingCall::PersistPaused,
+            RecordingCall::ConfirmRuntimeStopped
         ]
     );
 
@@ -4194,7 +4698,8 @@ async fn shutdown_pauses_running_sandboxes_and_rejects_new_lifecycle_operations(
 }
 
 #[tokio::test]
-async fn shutdown_succeeds_when_stop_after_pause_fails() -> Result<()> {
+async fn shutdown_reports_unconfirmed_stop_and_retains_the_original_backend_for_cleanup(
+) -> Result<()> {
     setup();
     let behavior = Arc::new(MockBehavior::new());
     behavior.push_action(
@@ -4226,13 +4731,14 @@ async fn shutdown_succeeds_when_stop_after_pause_fails() -> Result<()> {
         .await?;
     let sandbox_id = created.id;
 
-    orchestrator.shutdown().await?;
+    assert!(orchestrator.shutdown().await.is_err());
 
     let metadata = orchestrator
         .get_sandbox(&sandbox_id)
         .await?
         .expect("paused sandbox metadata should remain after shutdown");
     assert_eq!(metadata.state, SandboxState::Paused);
+    assert!(!metadata.runtime_stopped);
 
     orchestrator.delete_sandbox(sandbox_id).await?;
     Ok(())
@@ -4308,7 +4814,8 @@ async fn shutdown_returns_error_after_exhausting_pause_retries() -> Result<()> {
 }
 
 #[tokio::test]
-async fn shutdown_reuses_recorded_success_instead_of_running_cleanup_again() -> Result<()> {
+async fn shutdown_reuses_recorded_failure_instead_of_claiming_unconfirmed_stop_succeeded(
+) -> Result<()> {
     setup();
     let behavior = Arc::new(MockBehavior::new());
     behavior.push_action(
@@ -4340,8 +4847,9 @@ async fn shutdown_reuses_recorded_success_instead_of_running_cleanup_again() -> 
         .await?;
     let sandbox_id = created.id;
 
-    orchestrator.shutdown().await?;
-    orchestrator.shutdown().await?;
+    let first = orchestrator.shutdown().await.unwrap_err();
+    let second = orchestrator.shutdown().await.unwrap_err();
+    assert_eq!(first.to_string(), second.to_string());
 
     let metadata = orchestrator
         .get_sandbox(&sandbox_id)

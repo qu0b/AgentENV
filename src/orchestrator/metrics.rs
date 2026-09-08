@@ -18,7 +18,7 @@ pub struct OrchestratorMetrics {
     pub starting_sandbox_count: u32,
     pub allocated_cpu: u32,
     pub allocated_memory_bytes: u64,
-    /// Number of sandboxes currently in the `Paused` state.
+    /// Number of paused sandboxes whose runtime stop is confirmed.
     pub paused_sandbox_count: u32,
     pub paused_allocated_cpu: u32,
     pub paused_allocated_memory_bytes: u64,
@@ -66,10 +66,11 @@ impl OrchestratorCounters {
 ///   incremental-counter behavior, where `running_sandbox_count` was not
 ///   decremented on entry to those transitional states.
 /// - `starting_sandbox_count` counts only `Creating` and `Resuming`.
-/// - Allocated CPU / memory are counted in every state except `Paused`, since
-///   a paused sandbox has released its VM-side resources.
+/// - Allocated CPU / memory are counted until a paused sandbox has confirmed
+///   its runtime stop. Unconfirmed paused runtimes and cleanup debt continue
+///   to reserve capacity; they are also included in the running count.
 /// - `paused_sandbox_count` and the `paused_allocated_*` fields are populated
-///   only for the `Paused` state, and are tracked separately from the active
+///   only for confirmed `Paused` sandboxes, and are tracked separately from the active
 ///   running set so that schedulers can apply an "including paused" ceiling
 ///   without conflating the two.
 #[derive(Clone, Copy, Debug, Default)]
@@ -84,8 +85,12 @@ pub(crate) struct SandboxContribution {
 }
 
 impl SandboxContribution {
-    pub(crate) fn new(state: SandboxState, resources: SandboxResources) -> Self {
-        let is_paused = matches!(state, SandboxState::Paused);
+    pub(crate) fn new(
+        state: SandboxState,
+        resources: SandboxResources,
+        runtime_stopped: bool,
+    ) -> Self {
+        let is_paused = matches!(state, SandboxState::Paused) && runtime_stopped;
         let counts_as_running = matches!(
             state,
             SandboxState::Running
@@ -93,7 +98,8 @@ impl SandboxContribution {
                 | SandboxState::Snapshotting
                 | SandboxState::Forking
                 | SandboxState::Killing
-        );
+                | SandboxState::CleanupPending
+        ) || (state == SandboxState::Paused && !runtime_stopped);
         let counts_as_starting = matches!(state, SandboxState::Creating | SandboxState::Resuming);
         let memory_bytes = u64::from(resources.memory_mib) * 1024 * 1024;
         Self {
@@ -151,6 +157,7 @@ mod tests {
     fn meta(state: SandboxState, cpu: u32, memory_mib: u32) -> SandboxMetadata {
         SandboxMetadata {
             state,
+            runtime_stopped: state == SandboxState::Paused,
             resources: SandboxResources {
                 cpu_count: cpu,
                 memory_mib,
@@ -165,7 +172,11 @@ mod tests {
         for metadata in metas {
             aggregate_resource_metrics(
                 &mut metrics,
-                SandboxContribution::new(metadata.state, metadata.resources),
+                SandboxContribution::new(
+                    metadata.state,
+                    metadata.resources,
+                    metadata.runtime_stopped,
+                ),
             );
         }
         metrics

@@ -17,6 +17,8 @@ pub(crate) enum RecordingCall {
     PersistPaused,
     MarkResuming,
     RollbackResuming,
+    PersistDeleting,
+    ConfirmRuntimeStopped,
     DeleteRecord,
     DeleteRecordAndArtifacts,
 }
@@ -29,6 +31,8 @@ impl RecordingCall {
             Self::PersistPaused => "persist_paused",
             Self::MarkResuming => "mark_resuming",
             Self::RollbackResuming => "rollback_resuming",
+            Self::PersistDeleting => "persist_deleting",
+            Self::ConfirmRuntimeStopped => "confirm_runtime_stopped",
             Self::DeleteRecord => "delete_record",
             Self::DeleteRecordAndArtifacts => "delete_record_and_artifacts",
         }
@@ -135,6 +139,18 @@ impl SandboxPersister for RecordingPersister {
     async fn delete_record(&self, _sandbox_id: &SandboxId) -> PersistenceResult<()> {
         self.record(RecordingCall::DeleteRecord);
         self.maybe_fail(RecordingCall::DeleteRecord)?;
+        Ok(())
+    }
+
+    async fn persist_deleting(&self, _metadata: &SandboxMetadata) -> PersistenceResult<()> {
+        self.record(RecordingCall::PersistDeleting);
+        self.maybe_fail(RecordingCall::PersistDeleting)?;
+        Ok(())
+    }
+
+    async fn confirm_runtime_stopped(&self, _sandbox_id: &SandboxId) -> PersistenceResult<()> {
+        self.record(RecordingCall::ConfirmRuntimeStopped);
+        self.maybe_fail(RecordingCall::ConfirmRuntimeStopped)?;
         Ok(())
     }
 

@@ -87,6 +87,7 @@ impl From<OrchestratorError> for models::Error {
 impl From<SandboxState> for models::SandboxState {
     fn from(state: SandboxState) -> Self {
         match state {
+            SandboxState::CleanupPending => Self::CleanupPending,
             SandboxState::Pausing
             | SandboxState::Paused
             | SandboxState::Snapshotting
@@ -1328,7 +1329,7 @@ impl Sandboxes<()> for ApiImpl {
                     ),
                 );
             }
-            SandboxState::Killing => {
+            SandboxState::Killing | SandboxState::CleanupPending => {
                 return Ok(SandboxesSandboxIdConnectPostResponse::Status404_NotFound(
                     sandbox_not_found(sandbox_id),
                 ));
@@ -2022,15 +2023,20 @@ impl Sandboxes<()> for ApiImpl {
         _claims: &Self::Claims,
         query_params: &models::V2SandboxesGetQueryParams,
     ) -> Result<V2SandboxesGetResponse, ()> {
-        let states = if query_params.state.len() == 1 {
-            Some(vec![match query_params.state[0] {
-                models::SandboxState::Running => SandboxState::Running,
-                models::SandboxState::Paused => SandboxState::Paused,
-            }])
-        } else {
-            // Only two states are supported. If multiple states are provided,
-            // treat it as no state filter (i.e. return all sandboxes regardless of state)
+        let states: Option<Vec<SandboxState>> = if query_params.state.is_empty() {
             None
+        } else {
+            Some(
+                query_params
+                    .state
+                    .iter()
+                    .map(|state| match state {
+                        models::SandboxState::Running => SandboxState::Running,
+                        models::SandboxState::Paused => SandboxState::Paused,
+                        models::SandboxState::CleanupPending => SandboxState::CleanupPending,
+                    })
+                    .collect(),
+            )
         };
         let include_running = states
             .as_ref()
