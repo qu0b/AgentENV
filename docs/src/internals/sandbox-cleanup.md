@@ -38,10 +38,54 @@ failure returned success.
 
 Real subprocess and filesystem tests reproduce both failures against the
 preceding implementation. Process confirmation alone does not establish full
-native cleanup: interrupted native effects and warm-process cleanup still
-require reconciliation. Device and network ownership corrections are described
-below. Missing
+native cleanup: interrupted native effects still require reconciliation. Device,
+network and warm-process ownership corrections are described below. Missing
 in-memory handles remain insufficient proof after process death.
+
+### Warm process ownership through creation and cleanup
+
+A warm entry guards its Firecracker instance, work directory and network slot
+as one ownership unit before spawning. Dropping a failed or cancelled attempt
+queues that unit for a later cleanup pass; it does not drop its individual
+resources. Every entry in a drained or completed creation batch has this guard,
+including entries not yet visited when an async cleanup loop is cancelled.
+Successful snapshot acquisition transfers the intact unit synchronously to the
+native sandbox and removes it from the pool's ownership accounting.
+
+The Firecracker instance retains the scoped launcher's outcome receiver before
+awaiting it. Cancelling launch or stop cannot discard that receiver. Stop must
+resolve the launch and confirm the original child's exit before proceeding.
+A disconnected launcher with no outcome remains explicitly unresolved across
+retries; it cannot be interpreted as absence or overwritten with a new launch.
+Process-exit cleanup polls the retained receiver and child synchronously, with
+bounded waits and forced termination. It does not rely on entering a Tokio
+runtime or on dropping a child as proof of exit.
+
+After stop succeeds, cleanup tears down the original network slot while retaining
+it on error. Only then does it explicitly remove the work directory, reporting
+filesystem errors instead of suppressing them through `TempDir::drop`. Failed
+cleanup retains the remaining ownership for retry. Maintenance and shutdown
+take bounded, disjoint batches; one failed owner does not skip others in the
+batch. Shutdown also checks all outstanding owners, so it cannot return success
+while another caller still owns an active cleanup pass.
+
+Tests use real child processes and filesystem failures with logical network
+reservations. They cover cancellation during launch/readiness, shutdown and
+overflow cleanup, repeated failed/cancelled retries, continued independent
+cleanup, network ownership errors, synchronous cleanup after Tokio destruction,
+successful handoff, and concurrent shutdown. These establish in-process
+ownership, not KVM or kernel network cleanup. Pending ownership is not durable;
+maintenance retries depend on maintenance activity or explicit shutdown retry.
+Retry cadence/backoff, pending-capacity limits, abnormal native sandbox drop,
+lost-launch reconciliation and target-host failures remain separate acceptance
+work. No installed service or public/persisted schema is changed by this fix.
+
+Validation for this round: 97 Firecracker, 71 network, 3 ublk wrapper, 10
+extra-drive, 144 orchestrator, 4 capability-launcher, 13 generic warm-pool and 97
+daemon tests pass (439 distinct cases). Four privileged network/capability cases
+remain ignored. All-target/all-feature clippy with warnings denied and workspace
+formatting pass. Reintroducing continued cleanup after failed stop and removing
+the outstanding-owner shutdown check causes three focused regression failures.
 
 ## Acquisition-owned device operations
 
@@ -169,8 +213,8 @@ durable. Kernel veth deletion still identifies the interface by its slot-derived
 name, so interface-incarnation verification and recovery across processes or
 restart remain unqualified. Existing host-interface discovery reserves indices
 but cannot establish cleanup authority for an old namespace. Warm Firecracker
-cleanup still logs stop failures before proceeding with network cleanup; its
-process/resource ownership must be corrected before full native acceptance.
+cleanup now retains its process/resource owner as described above; this does not
+establish kernel interface incarnation ownership or native-host recovery.
 Daemon shutdown, native recovery and target-host failure qualification remain
 open. Do not infer physical erasure or safe placement after process loss.
 

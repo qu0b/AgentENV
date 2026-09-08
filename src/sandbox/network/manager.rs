@@ -296,6 +296,15 @@ impl NetworkManager {
         self.release_retained_with(slot, true, false, Slot::cleanup)
     }
 
+    /// Tear down without transferring a failed slot away from its resource group.
+    pub(crate) fn cleanup_retained(
+        &self,
+        slot: &mut Option<Slot>,
+        sync_cleanup: bool,
+    ) -> Result<()> {
+        self.release_retained_with(slot, false, sync_cleanup, Slot::cleanup)
+    }
+
     fn release_retained_with<F>(
         &self,
         slot: &mut Option<Slot>,
@@ -355,6 +364,7 @@ impl NetworkManager {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn cleanup_allocated_slot(&self, slot: Slot, sync_cleanup: bool) -> Result<()> {
         self.cleanup_slot_and_release_bit_inner(slot, sync_cleanup)
     }

@@ -5,7 +5,7 @@
 //! entry to skip process spawn and API socket polling on the critical path.
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -43,13 +43,94 @@ fn register_process_exit_hook(handler: extern "C" fn()) -> i32 {
 
 /// One warm entry handed to a sandbox as an indivisible ownership unit.
 pub(crate) struct WarmFirecracker {
-    pub slot: Slot,
-    pub fc_instance: FirecrackerInstance,
-    pub work_dir: TempDir,
+    resources: Option<WarmResources>,
+    cleanup_pending: Arc<Mutex<WarmCleanupState>>,
+}
+
+#[derive(Default)]
+struct WarmCleanupState {
+    pending: Vec<WarmResources>,
+    outstanding: usize,
+}
+
+struct WarmResources {
+    slot: Option<Slot>,
+    fc_instance: FirecrackerInstance,
+    work_dir: TempDir,
+}
+
+impl WarmFirecracker {
+    fn new(resources: WarmResources, cleanup_pending: &Arc<Mutex<WarmCleanupState>>) -> Self {
+        cleanup_pending
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .outstanding += 1;
+        Self::from_pending(resources, cleanup_pending)
+    }
+
+    fn from_pending(
+        resources: WarmResources,
+        cleanup_pending: &Arc<Mutex<WarmCleanupState>>,
+    ) -> Self {
+        Self {
+            resources: Some(resources),
+            cleanup_pending: Arc::clone(cleanup_pending),
+        }
+    }
+
+    fn release_ownership(&mut self) -> WarmResources {
+        let resources = self.resources.take().expect("owned warm resources");
+        self.cleanup_pending
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .outstanding -= 1;
+        resources
+    }
+
+    /// Transfer all resources synchronously to the native sandbox. Only intact,
+    /// ready entries are ever published to the warm pool.
+    pub(crate) fn into_parts(mut self) -> (Slot, FirecrackerInstance, TempDir) {
+        let resources = self.release_ownership();
+        (
+            resources.slot.expect("ready warm slot"),
+            resources.fc_instance,
+            resources.work_dir,
+        )
+    }
+}
+
+impl Drop for WarmFirecracker {
+    fn drop(&mut self) {
+        if let Some(resources) = self.resources.take() {
+            // No I/O or async work in Drop. This also protects every unvisited
+            // entry in a cancelled batch, and partially completed creation.
+            self.cleanup_pending
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .pending
+                .push(resources);
+        }
+    }
+}
+
+impl WarmResources {
+    fn finish_cleanup(&mut self, network: &NetworkManager, sync_cleanup: bool) -> Result<()> {
+        network
+            .cleanup_retained(&mut self.slot, sync_cleanup)
+            .context("firecracker pool: cleanup warm network slot")?;
+        // TempDir::drop hides deletion errors. Explicit removal retains the
+        // original directory owner on error and permits a later retry.
+        match std::fs::remove_dir_all(self.work_dir.path()) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err).context("firecracker pool: remove warm work dir"),
+        }
+    }
 }
 
 pub struct FirecrackerPool {
     pool: WarmPool<WarmFirecracker>,
+    cleanup_pending: Arc<Mutex<WarmCleanupState>>,
     binary: PathBuf,
     socket_timeout: Duration,
     socket_poll_interval: Duration,
@@ -118,6 +199,7 @@ impl FirecrackerPool {
 
         Self {
             pool: WarmPool::new(pool_config.pool),
+            cleanup_pending: Arc::new(Mutex::new(WarmCleanupState::default())),
             binary,
             socket_timeout,
             socket_poll_interval,
@@ -148,15 +230,20 @@ impl FirecrackerPool {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
-        let drained = self.pool.drain_all();
+        self.shutdown_with_network(NetworkManager::global()).await
+    }
+
+    async fn shutdown_with_network(&self, network: &NetworkManager) -> Result<()> {
+        let mut drained = self.pool.drain_all();
+        drained.extend(self.take_pending_cleanup());
         let mut failures = Vec::new();
         for warm in drained {
-            if let Err(err) = self.cleanup_warm_async(warm).await {
+            if let Err(err) = self.cleanup_warm_async(warm, network).await {
                 failures.push(err.to_string());
             }
         }
 
-        firecracker_pool_cleanup_result(failures)
+        self.shutdown_result(failures)
     }
 
     fn shutdown_for_process_exit(&self) -> Result<()> {
@@ -164,14 +251,31 @@ impl FirecrackerPool {
     }
 
     fn shutdown_blocking(&self, sync_network_cleanup: bool) -> Result<()> {
-        let drained = self.pool.drain_all();
+        let mut drained = self.pool.drain_all();
+        drained.extend(self.take_pending_cleanup());
         let mut failures = Vec::new();
         for warm in drained {
-            if let Err(err) = self.cleanup_warm_blocking(warm, sync_network_cleanup) {
+            if let Err(err) =
+                self.cleanup_warm_blocking(warm, sync_network_cleanup, NetworkManager::global())
+            {
                 failures.push(err.to_string());
             }
         }
 
+        self.shutdown_result(failures)
+    }
+
+    fn shutdown_result(&self, mut failures: Vec<String>) -> Result<()> {
+        let outstanding = self
+            .cleanup_pending
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .outstanding;
+        if outstanding != 0 {
+            failures.push(format!(
+                "warm Firecracker cleanup still owns {outstanding} entries"
+            ));
+        }
         firecracker_pool_cleanup_result(failures)
     }
 
@@ -228,22 +332,34 @@ impl FirecrackerPool {
     }
 
     fn run_maintenance_cycle(&self) -> Result<()> {
+        let mut failures = Vec::new();
+        for warm in self.take_pending_cleanup() {
+            if let Err(err) = self.cleanup_warm_blocking(warm, false, NetworkManager::global()) {
+                failures.push(err.to_string());
+            }
+        }
         match self.pool.compute_maintenance_action(self.pool.len()) {
             PoolMaintenanceAction::Fill(to_fill) => {
-                self.runtime.block_on(self.fill_warm_entries(to_fill))?;
+                if let Err(err) = self.runtime.block_on(self.fill_warm_entries(to_fill)) {
+                    failures.push(err.to_string());
+                }
             }
             PoolMaintenanceAction::Drain(to_drain) => {
                 for _ in 0..to_drain {
                     let Some(warm) = self.pool.try_drain_one() else {
                         break;
                     };
-                    self.cleanup_warm_blocking(warm, false)?;
+                    if let Err(err) =
+                        self.cleanup_warm_blocking(warm, false, NetworkManager::global())
+                    {
+                        failures.push(err.to_string());
+                    }
                 }
             }
             PoolMaintenanceAction::Idle => {}
         }
 
-        Ok(())
+        firecracker_pool_cleanup_result(failures)
     }
 
     async fn fill_warm_entries(&self, to_fill: usize) -> Result<()> {
@@ -256,27 +372,10 @@ impl FirecrackerPool {
             // refill behavior.
             let batch_size = remaining.min(self.fill_concurrency);
             let results = join_all((0..batch_size).map(|_| self.create_warm_async())).await;
-            let mut saw_failure = false;
-
-            for result in results {
-                match result {
-                    Ok(warm) => {
-                        if let Err(warm) = self.pool.try_push_bounded(warm) {
-                            if let Err(err) = self.cleanup_warm_async(warm).await {
-                                warn!(
-                                    error = %err,
-                                    "firecracker pool: cleanup of unqueued warm entry failed"
-                                );
-                                cleanup_failures.push(err.to_string());
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        saw_failure = true;
-                        debug!(error = %err, "skipping firecracker pool refill attempt");
-                    }
-                }
-            }
+            let (saw_failure, failures) = self
+                .publish_warm_batch(results, NetworkManager::global())
+                .await;
+            cleanup_failures.extend(failures);
 
             if saw_failure {
                 break;
@@ -288,117 +387,140 @@ impl FirecrackerPool {
         Ok(())
     }
 
+    async fn publish_warm_batch(
+        &self,
+        results: Vec<Result<WarmFirecracker>>,
+        network: &NetworkManager,
+    ) -> (bool, Vec<String>) {
+        let mut cleanup_failures = Vec::new();
+        let mut saw_failure = false;
+
+        for result in results {
+            match result {
+                Ok(warm) => {
+                    if let Err(warm) = self.pool.try_push_bounded(warm) {
+                        if let Err(err) = self.cleanup_warm_async(warm, network).await {
+                            warn!(
+                                error = %err,
+                                "firecracker pool: cleanup of unqueued warm entry failed"
+                            );
+                            cleanup_failures.push(err.to_string());
+                        }
+                    }
+                }
+                Err(err) => {
+                    saw_failure = true;
+                    debug!(error = %err, "skipping firecracker pool refill attempt");
+                }
+            }
+        }
+
+        (saw_failure, cleanup_failures)
+    }
+
     #[tracing::instrument(skip(self))]
     async fn create_warm_async(&self) -> Result<WarmFirecracker> {
+        let work_dir = create_firecracker_work_dir(self.firecracker_work_base_dir.as_deref())
+            .context("firecracker pool: create work dir")?;
         let slot = NetworkManager::global()
             .allocate_any()
             .context("firecracker pool: allocate network slot")?;
 
-        let work_dir = match create_firecracker_work_dir(self.firecracker_work_base_dir.as_deref())
-        {
-            Ok(work_dir) => work_dir,
-            Err(err) => {
-                let _ = NetworkManager::global().release(slot);
-                return Err(err).context("firecracker pool: create work dir");
-            }
-        };
+        let namespace = slot.namespace_path();
+        self.start_warm(slot, work_dir, Some(namespace)).await
+    }
 
-        let mut fc_instance = FirecrackerInstance::new(work_dir.path().to_path_buf());
+    async fn start_warm(
+        &self,
+        slot: Slot,
+        work_dir: TempDir,
+        namespace: Option<PathBuf>,
+    ) -> Result<WarmFirecracker> {
         let stdout_path = warm_stdout_path(work_dir.path());
         let stderr_path = warm_stderr_path(work_dir.path());
-        let spawn_result: Result<()> = async {
-            fc_instance
-                .spawn_with_netns(
-                    &self.binary,
-                    Some(&stdout_path),
-                    Some(&stderr_path),
-                    Some(&slot.namespace_path()),
-                )
-                .await
-                .context("spawn warm firecracker process")?;
-            fc_instance
-                .wait_for_ready(self.socket_timeout, self.socket_poll_interval)
-                .await
-                .context("wait for warm firecracker api socket")
-        }
-        .await;
-
-        if let Err(err) = spawn_result {
-            let _ = fc_instance.stop(POOL_FIRECRACKER_STOP_TIMEOUT).await;
-            let _ = NetworkManager::global().release(slot);
-            return Err(err);
-        }
+        let mut warm = WarmFirecracker::new(
+            WarmResources {
+                fc_instance: FirecrackerInstance::new(work_dir.path().to_path_buf()),
+                slot: Some(slot),
+                work_dir,
+            },
+            &self.cleanup_pending,
+        );
+        // Publish cleanup ownership before the first await, including the
+        // launcher's outcome receiver while its thread is still starting.
+        let resources = warm.resources.as_mut().expect("owned warm resources");
+        resources
+            .fc_instance
+            .spawn_with_netns(
+                &self.binary,
+                Some(&stdout_path),
+                Some(&stderr_path),
+                namespace.as_deref(),
+            )
+            .await
+            .context("spawn warm firecracker process")?;
+        resources
+            .fc_instance
+            .wait_for_ready(self.socket_timeout, self.socket_poll_interval)
+            .await
+            .context("wait for warm firecracker api socket")?;
 
         debug!(
-            slot = slot.idx,
-            work_dir = %work_dir.path().display(),
+            slot = resources.slot.as_ref().expect("warm slot").idx,
+            work_dir = %resources.work_dir.path().display(),
             "firecracker pool warm entry ready"
         );
-        Ok(WarmFirecracker {
-            slot,
-            fc_instance,
-            work_dir,
-        })
+        Ok(warm)
+    }
+
+    fn take_pending_cleanup(&self) -> Vec<WarmFirecracker> {
+        // Wrap the entire batch before any await so cancellation requeues even
+        // entries the cleanup loop has not visited. Concurrent passes are disjoint.
+        std::mem::take(
+            &mut self
+                .cleanup_pending
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .pending,
+        )
+        .into_iter()
+        .map(|resources| WarmFirecracker::from_pending(resources, &self.cleanup_pending))
+        .collect()
     }
 
     fn cleanup_warm_blocking(
         &self,
-        warm: WarmFirecracker,
+        mut warm: WarmFirecracker,
         sync_network_cleanup: bool,
+        network: &NetworkManager,
     ) -> Result<()> {
-        let WarmFirecracker {
-            slot,
-            mut fc_instance,
-            work_dir,
-        } = warm;
-        let slot_idx = slot.idx;
-
+        let resources = warm.resources.as_mut().expect("owned warm resources");
         if sync_network_cleanup {
-            // Process-exit hooks can run after Tokio runtime thread-local state
-            // has been destroyed. Avoid Runtime::block_on here; Drop kills the
-            // child process without entering Tokio.
-            drop(fc_instance);
+            resources
+                .fc_instance
+                .stop_blocking(POOL_FIRECRACKER_STOP_TIMEOUT)?;
         } else {
-            let stop_result = self
-                .runtime
-                .block_on(fc_instance.stop(POOL_FIRECRACKER_STOP_TIMEOUT));
-            if let Err(err) = stop_result {
-                warn!(
-                    slot = slot_idx,
-                    error = %err,
-                    "firecracker pool: stop warm process failed"
-                );
-            }
+            self.runtime
+                .block_on(resources.fc_instance.stop(POOL_FIRECRACKER_STOP_TIMEOUT))?;
         }
-
-        drop(work_dir);
-
-        NetworkManager::global()
-            .cleanup_allocated_slot(slot, sync_network_cleanup)
-            .context("firecracker pool: cleanup warm network slot")
+        resources.finish_cleanup(network, sync_network_cleanup)?;
+        drop(warm.release_ownership());
+        Ok(())
     }
 
-    async fn cleanup_warm_async(&self, warm: WarmFirecracker) -> Result<()> {
-        let WarmFirecracker {
-            slot,
-            mut fc_instance,
-            work_dir,
-        } = warm;
-        let slot_idx = slot.idx;
-
-        if let Err(err) = fc_instance.stop(POOL_FIRECRACKER_STOP_TIMEOUT).await {
-            warn!(
-                slot = slot_idx,
-                error = %err,
-                "firecracker pool: stop warm process failed"
-            );
-        }
-
-        drop(work_dir);
-
-        NetworkManager::global()
-            .cleanup_allocated_slot(slot, false)
-            .context("firecracker pool: cleanup warm network slot")
+    async fn cleanup_warm_async(
+        &self,
+        mut warm: WarmFirecracker,
+        network: &NetworkManager,
+    ) -> Result<()> {
+        let resources = warm.resources.as_mut().expect("owned warm resources");
+        resources
+            .fc_instance
+            .stop(POOL_FIRECRACKER_STOP_TIMEOUT)
+            .await?;
+        resources.finish_cleanup(network, false)?;
+        drop(warm.release_ownership());
+        Ok(())
     }
 }
 
@@ -420,3 +542,7 @@ pub(crate) fn warm_stdout_path(work_dir: &Path) -> PathBuf {
 pub(crate) fn warm_stderr_path(work_dir: &Path) -> PathBuf {
     work_dir.join("firecracker-stderr.log")
 }
+
+#[cfg(test)]
+#[path = "pool_cleanup_tests.rs"]
+mod cleanup_tests;

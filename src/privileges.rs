@@ -86,10 +86,26 @@ where
 /// spawn path, so the multi-threaded server process does not need a `pre_exec`
 /// hook and remains eligible for `posix_spawn`.
 pub async fn spawn_tokio_command_scoped<F>(
-    mut command: tokio::process::Command,
+    command: tokio::process::Command,
     capabilities: &'static [i32],
     before_capability_scope: F,
 ) -> io::Result<tokio::process::Child>
+where
+    F: FnOnce() -> io::Result<()> + Send + 'static,
+{
+    start_tokio_command_scoped(command, capabilities, before_capability_scope)?
+        .await
+        .map_err(|_| io::Error::other("scoped command launcher exited without returning a child"))?
+}
+
+/// Start a launcher while allowing its owner to retain the outcome receiver
+/// across cancellation. A retained receiver must be resolved before releasing
+/// resources that the launcher or child may still use.
+pub(crate) fn start_tokio_command_scoped<F>(
+    mut command: tokio::process::Command,
+    capabilities: &'static [i32],
+    before_capability_scope: F,
+) -> io::Result<tokio::sync::oneshot::Receiver<io::Result<tokio::process::Child>>>
 where
     F: FnOnce() -> io::Result<()> + Send + 'static,
 {
@@ -117,9 +133,7 @@ where
             }
         })?;
 
-    receiver
-        .await
-        .map_err(|_| io::Error::other("scoped command launcher exited without returning a child"))?
+    Ok(receiver)
 }
 
 fn terminate_unclaimed_child(mut child: tokio::process::Child) {

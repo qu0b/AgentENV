@@ -1736,18 +1736,19 @@ impl FirecrackerSandbox {
 
         if config.common.stdout_path.is_none() && config.common.stderr_path.is_none() {
             if let Some(warm) = FirecrackerPool::global().and_then(|pool| pool.try_acquire()) {
-                let warm_dir = warm.work_dir.path();
+                let (slot, fc_instance, work_dir) = warm.into_parts();
+                let warm_dir = work_dir.path();
                 let warm_stdout = warm_stdout_path(warm_dir);
                 let warm_stderr = warm_stderr_path(warm_dir);
                 debug!(
-                    slot = warm.slot.idx,
+                    slot = slot.idx,
                     pool_work_dir = %warm_dir.display(),
                     "using warm firecracker from pool"
                 );
 
-                self.network_slot = Some(warm.slot);
-                self.work_dir = warm.work_dir; // Update self.work_dir before relocating logs since the fallback log paths are relative to the work_dir.
-                let _cold = std::mem::replace(&mut self.fc_instance, warm.fc_instance);
+                self.network_slot = Some(slot);
+                self.work_dir = work_dir; // Update self.work_dir before relocating logs since the fallback log paths are relative to the work_dir.
+                let _cold = std::mem::replace(&mut self.fc_instance, fc_instance);
                 if let Err(err) = relocate_warm_log(&warm_stdout, &self.firecracker_stdout_path()) {
                     warn!(error = %err, "failed to relocate warm firecracker stdout log");
                 }

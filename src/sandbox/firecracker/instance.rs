@@ -37,6 +37,8 @@ pub(crate) struct FirecrackerInstance {
     socket_path: PathBuf,
     stderr_path: Option<PathBuf>,
     process: Option<Child>,
+    pending_process: Option<tokio::sync::oneshot::Receiver<std::io::Result<Child>>>,
+    launch_outcome_lost: bool,
 }
 
 impl FirecrackerInstance {
@@ -48,6 +50,8 @@ impl FirecrackerInstance {
             socket_path,
             stderr_path: None,
             process: None,
+            pending_process: None,
+            launch_outcome_lost: false,
         }
     }
 
@@ -68,7 +72,7 @@ impl FirecrackerInstance {
         stderr_path: Option<&Path>,
         netns: Option<&Path>,
     ) -> Result<()> {
-        if self.process.is_some() {
+        if self.process.is_some() || self.pending_process.is_some() || self.launch_outcome_lost {
             bail!("firecracker process already started");
         }
 
@@ -117,31 +121,49 @@ impl FirecrackerInstance {
 
         cmd.stdout(stdout).stderr(stderr);
 
-        let child = crate::privileges::spawn_tokio_command_scoped(cmd, &[], move || {
-            if let Some(netns) = netns {
-                // SAFETY: `netns` is an open network namespace descriptor and
-                // this short-lived launcher thread has not spawned a child yet.
-                let rc = unsafe { libc::setns(netns.as_raw_fd(), libc::CLONE_NEWNET) };
-                if rc != 0 {
-                    return Err(std::io::Error::last_os_error());
+        self.pending_process = Some(
+            crate::privileges::start_tokio_command_scoped(cmd, &[], move || {
+                if let Some(netns) = netns {
+                    // SAFETY: `netns` is an open network namespace descriptor and
+                    // this short-lived launcher thread has not spawned a child yet.
+                    let rc = unsafe { libc::setns(netns.as_raw_fd(), libc::CLONE_NEWNET) };
+                    if rc != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
                 }
-            }
-            Ok(())
-        })
-        .await
-        .context("failed to spawn firecracker")?;
+                Ok(())
+            })
+            .context("start firecracker launcher")?,
+        );
+        self.finish_pending_spawn().await?;
         trace!("firecracker process spawned");
 
         // Set oom_score_adj to maximum (1000) so the firecracker process is
         // the first candidate for OOM kill, protecting current agentenv server.
-        if let Some(pid) = child.id() {
+        if let Some(pid) = self.process.as_ref().and_then(Child::id) {
             let oom_path = format!("/proc/{pid}/oom_score_adj");
             if let Err(e) = fs::write(&oom_path, b"1000") {
                 warn!(pid, oom_path, err = %e, "failed to set oom_score_adj for firecracker");
             }
         }
 
-        self.process = Some(child);
+        Ok(())
+    }
+
+    async fn finish_pending_spawn(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            !self.launch_outcome_lost,
+            "firecracker launch outcome is unresolved"
+        );
+        if let Some(pending) = self.pending_process.as_mut() {
+            // A closed channel is unresolved ownership, not proof that no child
+            // was started. Retain that uncertainty so cleanup cannot claim success.
+            let outcome = pending.await;
+            self.pending_process = None;
+            self.launch_outcome_lost = outcome.is_err();
+            let outcome = outcome.context("receive firecracker launch outcome")?;
+            self.process = Some(outcome.context("failed to spawn firecracker")?);
+        }
         Ok(())
     }
 
@@ -214,6 +236,12 @@ impl FirecrackerInstance {
     /// but if the process does not exit within the specified timeout, it will send `SIGKILL` to force termination.
     #[tracing::instrument(skip(self))]
     pub async fn stop(&mut self, timeout: Duration) -> Result<()> {
+        // A cancelled spawn can still be running on its launcher thread.
+        // Receive its exact child before attempting stop or releasing resources.
+        time::timeout(timeout, self.finish_pending_spawn())
+            .await
+            .context("timed out receiving firecracker launch outcome")?
+            .context("resolve firecracker launcher before stop")?;
         debug!(
             timeout_ms = timeout.as_millis(),
             "stopping firecracker process"
@@ -252,6 +280,76 @@ impl FirecrackerInstance {
             self.process = None;
         }
 
+        self.remove_stopped_socket()
+    }
+
+    /// Process-exit cleanup cannot enter Tokio: thread-local runtime state may
+    /// already be gone. Polling Child::try_wait still reaps the owned child.
+    /// Keep both launcher and child handles on every uncertain outcome.
+    pub(crate) fn stop_blocking(&mut self, timeout: Duration) -> Result<()> {
+        anyhow::ensure!(
+            !self.launch_outcome_lost,
+            "firecracker launch outcome is unresolved"
+        );
+        let started = std::time::Instant::now();
+        while let Some(pending) = self.pending_process.as_mut() {
+            match pending.try_recv() {
+                Ok(outcome) => {
+                    self.pending_process = None;
+                    self.process = Some(outcome.context("failed to spawn firecracker")?);
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    self.pending_process = None;
+                    self.launch_outcome_lost = true;
+                    bail!("firecracker launcher exited without returning an outcome");
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    anyhow::ensure!(
+                        started.elapsed() < timeout,
+                        "timed out receiving firecracker launch outcome"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+        if let Some(child) = self.process.as_mut() {
+            for signal in [Signal::SIGTERM, Signal::SIGKILL] {
+                if child
+                    .try_wait()
+                    .context("inspect firecracker exit")?
+                    .is_some()
+                {
+                    break;
+                }
+                if let Some(pid) = child.id() {
+                    match kill(Pid::from_raw(pid as i32), signal) {
+                        Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+                        Err(error) => return Err(error).context("signal firecracker stop"),
+                    }
+                }
+                let started = std::time::Instant::now();
+                while child
+                    .try_wait()
+                    .context("confirm firecracker exit")?
+                    .is_none()
+                    && started.elapsed() < timeout
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            anyhow::ensure!(
+                child
+                    .try_wait()
+                    .context("confirm forced firecracker exit")?
+                    .is_some(),
+                "timed out confirming forced firecracker stop"
+            );
+            self.process = None;
+        }
+        self.remove_stopped_socket()
+    }
+
+    fn remove_stopped_socket(&self) -> Result<()> {
         match fs::remove_file(&self.socket_path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -644,6 +742,114 @@ mod tests {
     use super::*;
     use std::process::Command as StdCommand;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn cancelled_launch_keeps_receiver_until_child_is_stopped() -> Result<()> {
+        let temp = tempdir()?;
+        let mut instance = FirecrackerInstance::new(temp.path().into());
+        let (release, gate) = std::sync::mpsc::channel();
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let notify = entered.clone();
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "trap '' TERM; printf '%s' $$ > started; exec sleep 60",
+            ])
+            .current_dir(temp.path());
+        instance.pending_process = Some(crate::privileges::start_tokio_command_scoped(
+            command,
+            &[],
+            move || {
+                notify.notify_one();
+                gate.recv().map_err(std::io::Error::other)
+            },
+        )?);
+        time::timeout(Duration::from_secs(5), entered.notified()).await?;
+        assert!(
+            time::timeout(Duration::from_millis(20), instance.finish_pending_spawn())
+                .await
+                .is_err()
+        );
+        assert!(instance.stop(Duration::from_millis(20)).await.is_err());
+        assert!(instance.pending_process.is_some());
+        assert!(instance
+            .spawn_with_netns(Path::new("/bin/true"), None, None, None)
+            .await
+            .is_err());
+        release.send(())?;
+        let pid: i32 = time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(pid) = fs::read_to_string(temp.path().join("started")) {
+                    if let Ok(pid) = pid.parse() {
+                        break pid;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        instance.stop(Duration::from_millis(50)).await?;
+        assert!(instance.pending_process.is_none());
+        assert!(instance.process.is_none());
+        assert!(!PathBuf::from(format!("/proc/{pid}")).exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lost_launch_outcome_remains_unresolved_on_every_retry() -> Result<()> {
+        let temp = tempdir()?;
+        let mut instance = FirecrackerInstance::new(temp.path().into());
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        instance.pending_process = Some(receiver);
+        drop(sender);
+        for _ in 0..2 {
+            assert!(instance.stop(Duration::from_millis(20)).await.is_err());
+            assert!(instance.stop_blocking(Duration::from_millis(20)).is_err());
+            assert!(instance
+                .spawn_with_netns(Path::new("/bin/true"), None, None, None)
+                .await
+                .is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn blocking_stop_confirms_exit_after_runtime_is_destroyed() -> Result<()> {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let temp = tempdir()?;
+        let mut instance = FirecrackerInstance::new(temp.path().into());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let pid = runtime.block_on(async {
+            let mut child = Command::new("/bin/sh")
+                .args(["-c", "trap '' TERM; printf 'ready\\n'; exec sleep 60"])
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()?;
+            let mut ready = String::new();
+            BufReader::new(child.stdout.take().unwrap())
+                .read_line(&mut ready)
+                .await?;
+            assert_eq!(ready, "ready\n");
+            let pid = child.id().unwrap();
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            sender.send(Ok(child)).unwrap();
+            instance.pending_process = Some(receiver);
+            Ok::<_, anyhow::Error>(pid)
+        })?;
+        drop(runtime);
+        instance.stop_blocking(Duration::from_millis(50))?;
+        assert!(instance.pending_process.is_none());
+        assert!(instance.process.is_none());
+        assert!(!PathBuf::from(format!("/proc/{pid}")).exists());
+        fs::create_dir(&instance.socket_path)?;
+        assert!(instance.stop_blocking(Duration::from_millis(20)).is_err());
+        fs::remove_dir(&instance.socket_path)?;
+        instance.stop_blocking(Duration::from_millis(20))?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn wait_for_ready_times_out_when_socket_never_appears() {
