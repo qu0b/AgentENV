@@ -333,7 +333,7 @@ impl PosixFsCatalogStore {
     pub(crate) fn get_volume(&self, reference: &str) -> RepositoryResult<Option<VolumeRecord>> {
         self.ensure_volume_component(reference, "reference")?;
         if let Some(record) = self.load_volume_by_id_unlocked(reference)? {
-            return Ok(Some(record));
+            return Ok((!record.deletion_completed).then_some(record));
         }
         self.with_volume_alias_lock(reference, |store| {
             let alias_path =
@@ -343,13 +343,9 @@ impl PosixFsCatalogStore {
             }
             let volume_id: String = store.read_json(&alias_path)?;
             store.ensure_volume_id(&volume_id)?;
-            match store.load_volume_by_id_unlocked(&volume_id)? {
-                Some(record) => Ok(Some(record)),
-                None => {
-                    store.remove_file_if_exists(&alias_path)?;
-                    Ok(None)
-                }
-            }
+            Ok(store
+                .load_volume_by_id_unlocked(&volume_id)?
+                .filter(|record| !record.deletion_completed))
         })
     }
 
@@ -371,25 +367,34 @@ impl PosixFsCatalogStore {
             selected.retain(|volume_id| volume_id.as_str() > after);
         }
 
-        let has_more = selected.len() > limit;
-        selected.truncate(limit);
-        let mut records = Vec::with_capacity(selected.len());
+        let mut records: Vec<VolumeRecord> = Vec::new();
         for volume_id in selected {
             if let Some(record) = self.load_volume_by_id_unlocked(&volume_id)? {
+                if record.deletion_completed {
+                    continue;
+                }
+                if records.len() == limit {
+                    return Ok(VolumeRecordPage {
+                        next_volume_id: records.last().map(|record| record.id.clone()),
+                        records,
+                    });
+                }
                 records.push(record);
             }
         }
-        let next_volume_id = has_more
-            .then(|| records.last().map(|record| record.id.clone()))
-            .flatten();
         Ok(VolumeRecordPage {
             records,
-            next_volume_id,
+            next_volume_id: None,
         })
     }
 
     pub(crate) fn create_volume(&self, record: &VolumeRecord) -> RepositoryResult<()> {
         self.ensure_volume_id(&record.id)?;
+        if record.deletion_completed {
+            return Err(RepositoryError::InvalidRequest {
+                reason: "cannot create a completed volume deletion".into(),
+            });
+        }
         self.ensure_volume_component(&record.name, "name")?;
         self.with_volume_alias_lock(&record.name, |store| {
             let _record_guard = store.acquire_volume_record_lock(&record.id)?;
@@ -405,8 +410,11 @@ impl PosixFsCatalogStore {
             if alias_path.exists() {
                 let existing_id = store.read_json::<String>(&alias_path)?;
                 store.ensure_volume_id(&existing_id)?;
-                if PosixFsSnapshotArtifactLayout::volume_record_path(&store.root, &existing_id)
-                    .exists()
+                if !store
+                    .load_volume_by_id_unlocked(&existing_id)?
+                    .is_some_and(|previous| {
+                        previous.deletion_completed && previous.name == record.name
+                    })
                 {
                     return Err(RepositoryError::VolumeNameConflict {
                         name: record.name.clone(),
@@ -468,6 +476,9 @@ impl PosixFsCatalogStore {
         let Some(mut record) = self.load_volume_by_id_unlocked(volume_id)? else {
             return Ok(());
         };
+        if record.deletion_completed {
+            return Ok(());
+        }
         record
             .claim_deletion(owner)
             .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
@@ -488,22 +499,34 @@ impl PosixFsCatalogStore {
         let Some(existing) = self.load_volume_by_id_unlocked(volume_id)? else {
             return Ok(());
         };
+        let path = PosixFsSnapshotArtifactLayout::volume_record_path(&self.root, volume_id);
+        if existing.deletion_completed {
+            return self.sync_volume_record_parent(&path);
+        }
         self.with_volume_alias_lock(&existing.name, |store| {
             let _record_guard = store.acquire_volume_record_lock(volume_id)?;
-            let Some(record) = store.load_volume_by_id_unlocked(volume_id)? else {
+            let Some(mut record) = store.load_volume_by_id_unlocked(volume_id)? else {
                 return Ok(());
             };
+            if record.deletion_completed {
+                return store.sync_volume_record_parent(&path);
+            }
             record
                 .validate_deletion(owner)
                 .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
             let alias_path =
                 PosixFsSnapshotArtifactLayout::volume_alias_path(&store.root, &record.name);
-            if alias_path.exists() && store.read_json::<String>(&alias_path)? == volume_id {
-                store.remove_file_if_exists(&alias_path)?;
-                store.sync_volume_record_parent(&alias_path)?;
+            // Retain the name claim until the terminal record is durable. A
+            // future creator may replace it only after reading that evidence.
+            if alias_path.exists() {
+                let target: String = store.read_json(&alias_path)?;
+                store.ensure_volume_id(&target)?;
             }
             let path = PosixFsSnapshotArtifactLayout::volume_record_path(&store.root, volume_id);
-            store.remove_file_if_exists(&path)?;
+            record
+                .complete_deletion(owner)
+                .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
+            store.write_json(&path, &record)?;
             store.sync_volume_record_parent(&path)
         })
     }
@@ -657,6 +680,9 @@ impl PosixFsCatalogStore {
                 ),
             });
         }
+        record
+            .validate_tombstone()
+            .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
         Ok(Some(record))
     }
 
@@ -1380,6 +1406,7 @@ mod tests {
             read_only_mounts: Vec::new(),
             deleting: false,
             delete_owner: None,
+            deletion_completed: false,
         }
     }
 
@@ -1415,6 +1442,87 @@ mod tests {
         std::fs::remove_dir(&alias).unwrap();
         fresh.delete_volume(&record.id, owner).unwrap();
         assert!(fresh.get_volume(&record.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn volume_tombstones_keep_ids_unique_and_inventory_pages_complete() {
+        let root = TempDir::new().unwrap();
+        let store = PosixFsCatalogStore::new(root.path().to_owned());
+        let owner = uuid::Uuid::now_v7();
+        for index in 0..10 {
+            let record = volume_record(index);
+            store.create_volume(&record).unwrap();
+            if [2, 6, 9].contains(&index) {
+                continue;
+            }
+            store.begin_volume_deletion(&record.id, owner).unwrap();
+            store.delete_volume(&record.id, owner).unwrap();
+            assert!(store.get_volume(&record.id).unwrap().is_none());
+            assert!(store.get_volume(&record.name).unwrap().is_none());
+            assert!(
+                store
+                    .load_volume_by_id_unlocked(&record.id)
+                    .unwrap()
+                    .unwrap()
+                    .deletion_completed
+            );
+            assert!(store.create_volume(&record).is_err());
+            let mut alias_collision = volume_record(100 + index);
+            alias_collision.name = record.id.clone();
+            assert!(matches!(
+                store.create_volume(&alias_collision),
+                Err(RepositoryError::VolumeNameConflict { .. })
+            ));
+            assert!(store.get_volume(&record.id).unwrap().is_none());
+            assert!(store.put_volume(&record).is_err());
+            assert!(store.reserve_volume(&record.id, "new-owner").is_err());
+            store
+                .delete_volume(&record.id, uuid::Uuid::now_v7())
+                .unwrap();
+        }
+        let fresh = PosixFsCatalogStore::new(root.path().to_owned());
+        let first = fresh.list_volumes_page(None, 2).unwrap();
+        assert_eq!(
+            first
+                .records
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            ["vol_000002", "vol_000006"]
+        );
+        let second = fresh
+            .list_volumes_page(first.next_volume_id.as_deref(), 2)
+            .unwrap();
+        assert_eq!(
+            second
+                .records
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            ["vol_000009"]
+        );
+        assert!(second.next_volume_id.is_none());
+        let mut replacement = volume_record(10);
+        replacement.name = volume_record(0).name;
+        fresh.create_volume(&replacement).unwrap();
+        assert_eq!(
+            fresh.get_volume(&replacement.name).unwrap().unwrap().id,
+            replacement.id
+        );
+        let missing_alias =
+            super::PosixFsSnapshotArtifactLayout::volume_alias_path(root.path(), "unfinished-name");
+        fresh.write_json(&missing_alias, &"vol_missing").unwrap();
+        assert!(fresh.get_volume("unfinished-name").unwrap().is_none());
+        assert!(
+            missing_alias.exists(),
+            "missing record is not deletion evidence"
+        );
+        let mut competing = volume_record(11);
+        competing.name = "unfinished-name".into();
+        assert!(matches!(
+            fresh.create_volume(&competing),
+            Err(RepositoryError::VolumeNameConflict { .. })
+        ));
     }
 
     #[test]

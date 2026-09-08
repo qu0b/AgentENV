@@ -68,6 +68,9 @@ pub struct VolumeRecord {
     pub(crate) deleting: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) delete_owner: Option<Uuid>,
+    /// Completed deletion remains as an immutable catalog tombstone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) deletion_completed: bool,
 }
 
 impl VolumeRecord {
@@ -105,6 +108,31 @@ impl VolumeRecord {
         Ok(())
     }
 
+    pub(crate) fn complete_deletion(&mut self, owner: Uuid) -> Result<(), String> {
+        self.validate_deletion(owner)?;
+        self.deletion_completed = true;
+        self.status = VolumeStatus::Failed;
+        self.backing_layers.clear();
+        self.backing_image_config = None;
+        Ok(())
+    }
+
+    pub(crate) fn validate_tombstone(&self) -> Result<(), String> {
+        if self.deletion_completed {
+            let owner = self.delete_owner.ok_or_else(|| {
+                format!(
+                    "volume '{}' has completed deletion without an owner",
+                    self.id
+                )
+            })?;
+            self.validate_deletion(owner)?;
+            if self.status != VolumeStatus::Failed {
+                return Err("completed volume deletion must remain failed".into());
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn mounted_by(&self, owner: &str) -> bool {
         self.reserved_by_sandbox_id.as_deref() == Some(owner)
             || self.read_only_mounts.iter().any(|entry| entry == owner)
@@ -132,7 +160,10 @@ impl VolumeRecord {
         if self.deleting {
             return Err(format!("volume '{}' is being deleted", self.id));
         }
-        if self.deleting != next.deleting || self.delete_owner != next.delete_owner {
+        if self.deleting != next.deleting
+            || self.delete_owner != next.delete_owner
+            || self.deletion_completed != next.deletion_completed
+        {
             return Err("volume deletion state is owned by the deletion APIs".into());
         }
         if self.name != next.name || self.mode != next.mode || self.size_mb != next.size_mb {
@@ -445,6 +476,7 @@ impl VolumeManager {
             read_only_mounts: Vec::new(),
             deleting: false,
             delete_owner: None,
+            deletion_completed: false,
         };
         let create_result = async {
             if reserved_owner.is_none() {
@@ -575,6 +607,7 @@ impl VolumeManager {
             },
             deleting: false,
             delete_owner: None,
+            deletion_completed: false,
         };
         self.repository
             .create_volume(record.clone())

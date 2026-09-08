@@ -246,8 +246,9 @@ pub trait SnapshotRepository: Send + Sync {
         unsupported("volume catalog")
     }
 
-    /// Removes an already-claimed record after its owner's local cleanup succeeds.
-    /// Missing records are considered success; volume IDs must never be reused.
+    /// Completes an already-claimed deletion after its owner's local cleanup.
+    /// Retains terminal evidence while removing the volume from active inventory.
+    /// Missing or completed records are success; volume IDs must never be reused.
     async fn delete_volume(&self, _volume_id: &str, _owner: uuid::Uuid) -> RepositoryResult<()> {
         unsupported("volume catalog")
     }

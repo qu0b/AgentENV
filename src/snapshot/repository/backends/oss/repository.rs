@@ -559,8 +559,8 @@ impl SnapshotRepository for OssSnapshotRepository {
 
     async fn get_volume(&self, reference: &str) -> RepositoryResult<Option<VolumeRecord>> {
         validate_volume_component(reference, "reference")?;
-        if let Some(record) = self.read_volume_record(reference).await? {
-            return Ok(Some(record));
+        if let Some(record) = self.read_volume_record_including_deleted(reference).await? {
+            return Ok((!record.deletion_completed).then_some(record));
         }
         let alias_key = OssSnapshotArtifactLayout::volume_alias_key(reference);
         let volume_id = match self.client.get_bytes(&alias_key).await {
@@ -591,36 +591,45 @@ impl SnapshotRepository for OssSnapshotRepository {
         if let Some(volume_id) = after_volume_id {
             validate_volume_id(volume_id)?;
         }
-        let start_after = after_volume_id.map(OssSnapshotArtifactLayout::volume_record_key);
-        let mut keys = self
-            .client
-            .list_keys_page(
-                OssSnapshotArtifactLayout::volume_records_prefix(),
-                start_after.as_deref(),
-                limit.saturating_add(1),
-            )
-            .await
-            .map_err(|error| RepositoryError::backend("list volume records", error))?;
-        let has_more = keys.len() > limit;
-        keys.truncate(limit);
-        let mut records = Vec::with_capacity(keys.len());
-        for key in keys {
-            let volume_id = volume_id_from_record_key(&key)?;
-            let record = self.read_volume_record(&volume_id).await?.ok_or_else(|| {
-                RepositoryError::VolumeNotFound {
-                    lookup: volume_id.clone(),
+        let mut start_after = after_volume_id.map(OssSnapshotArtifactLayout::volume_record_key);
+        let batch_limit = limit.saturating_add(1).min(100);
+        let mut records: Vec<VolumeRecord> = Vec::new();
+        loop {
+            let keys = self
+                .client
+                .list_keys_page(
+                    OssSnapshotArtifactLayout::volume_records_prefix(),
+                    start_after.as_deref(),
+                    batch_limit,
+                )
+                .await
+                .map_err(|error| RepositoryError::backend("list volume records", error))?;
+            if keys.is_empty() {
+                break;
+            }
+            let exhausted = keys.len() < batch_limit;
+            for key in keys {
+                let volume_id = volume_id_from_record_key(&key)?;
+                start_after = Some(key);
+                // Completed deletion stays in the same key to prevent ID reuse.
+                // It must not leak into inventory or consume the visible page.
+                if let Some(record) = self.read_volume_record(&volume_id).await? {
+                    if records.len() == limit {
+                        return Ok(VolumeRecordPage {
+                            next_volume_id: records.last().map(|record| record.id.clone()),
+                            records,
+                        });
+                    }
+                    records.push(record);
                 }
-            })?;
-            records.push(record);
+            }
+            if exhausted {
+                break;
+            }
         }
-        let next_volume_id = if has_more {
-            records.last().map(|record| record.id.clone())
-        } else {
-            None
-        };
         Ok(VolumeRecordPage {
             records,
-            next_volume_id,
+            next_volume_id: None,
         })
     }
 
@@ -629,7 +638,20 @@ impl SnapshotRepository for OssSnapshotRepository {
         validate_volume_component(&record.name, "name")?;
         let mut record = record;
         record.backing_image_config = None;
-        if self.read_volume_record(&record.name).await?.is_some()
+        if record.deletion_completed
+            || self
+                .read_volume_record_versioned(&record.id)
+                .await?
+                .is_some()
+        {
+            return Err(RepositoryError::InvalidRequest {
+                reason: format!("volume '{}' already exists or was deleted", record.id),
+            });
+        }
+        if self
+            .read_volume_record_including_deleted(&record.name)
+            .await?
+            .is_some()
             || self
                 .client
                 .exists(&OssSnapshotArtifactLayout::volume_alias_key(&record.id))
@@ -731,6 +753,9 @@ impl SnapshotRepository for OssSnapshotRepository {
             else {
                 return Ok(());
             };
+            if record.deletion_completed {
+                return Ok(());
+            }
             record
                 .claim_deletion(owner)
                 .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
@@ -749,19 +774,31 @@ impl SnapshotRepository for OssSnapshotRepository {
 
     async fn delete_volume(&self, volume_id: &str, owner: uuid::Uuid) -> RepositoryResult<()> {
         validate_volume_id(volume_id)?;
-        let Some(record) = self.read_volume_record(volume_id).await? else {
-            return Ok(());
-        };
-        record
-            .validate_deletion(owner)
-            .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
-        // Keep the alias as a stale pointer, reclaimed by claim_volume_alias's
-        // conditional write once this record is absent. OpenDAL 0.55 has no
-        // ETag-conditional delete; read-then-delete could erase a replacement alias.
-        self.client
-            .delete(&OssSnapshotArtifactLayout::volume_record_key(volume_id))
-            .await
-            .map_err(|error| RepositoryError::backend("delete volume record", error))
+        for _attempt in 0..MAX_VOLUME_CAS_ATTEMPTS {
+            let Some((mut record, etag)) = self.read_volume_record_versioned(volume_id).await?
+            else {
+                return Ok(());
+            };
+            if record.deletion_completed {
+                return Ok(());
+            }
+            // A missing record can also mean that creation has not published yet.
+            // Keep terminal evidence in the original key: alias reuse requires it,
+            // and create-if-absent can never resurrect this volume ID.
+            record
+                .complete_deletion(owner)
+                .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
+            if self
+                .write_volume_record_conditionally(&record, etag.as_deref())
+                .await?
+            {
+                return Ok(());
+            }
+        }
+        Err(RepositoryError::Backend {
+            message: format!("volume '{volume_id}' changed too often while completing deletion"),
+            source: None,
+        })
     }
 
     async fn reserve_volume(
@@ -877,7 +914,13 @@ impl OssSnapshotRepository {
                     if existing_id == volume_id {
                         return Ok(true);
                     }
-                    if self.read_volume_record(&existing_id).await?.is_some() {
+                    let can_reuse = self
+                        .read_volume_record_versioned(&existing_id)
+                        .await?
+                        .is_some_and(|(record, _)| {
+                            record.deletion_completed && record.name == name
+                        });
+                    if !can_reuse {
                         return Ok(false);
                     }
                     etag
@@ -901,6 +944,16 @@ impl OssSnapshotRepository {
     }
 
     async fn read_volume_record(&self, volume_id: &str) -> RepositoryResult<Option<VolumeRecord>> {
+        Ok(self
+            .read_volume_record_including_deleted(volume_id)
+            .await?
+            .filter(|record| !record.deletion_completed))
+    }
+
+    async fn read_volume_record_including_deleted(
+        &self,
+        volume_id: &str,
+    ) -> RepositoryResult<Option<VolumeRecord>> {
         validate_volume_id(volume_id)?;
         let key = OssSnapshotArtifactLayout::volume_record_key(volume_id);
         match self.client.get_bytes(&key).await {
@@ -916,6 +969,9 @@ impl OssSnapshotRepository {
                         ),
                     });
                 }
+                record
+                    .validate_tombstone()
+                    .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
                 Ok(Some(record))
             }
             Err(error) if OssClient::is_not_found_error(&error) => Ok(None),
@@ -971,6 +1027,9 @@ impl OssSnapshotRepository {
                         ),
                     });
                 }
+                record
+                    .validate_tombstone()
+                    .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
                 let etag = etag.ok_or_else(|| RepositoryError::Unsupported {
                     feature: "OSS volume CAS requires ETags".to_string(),
                 })?;
@@ -1746,99 +1805,434 @@ mod tests {
         OssSnapshotRepository::new(Arc::new(client), SnapshotImageStoragePolicy::ObjectStorage)
     }
 
-    #[tokio::test]
-    async fn volume_deletion_claim_and_alias_reuse_over_s3_http() -> anyhow::Result<()> {
+    #[derive(Default)]
+    struct VolumeHttpState {
+        objects: tokio::sync::Mutex<std::collections::HashMap<String, (bytes::Bytes, String)>>,
+        gate: tokio::sync::Mutex<Option<Arc<VolumeWriteGate>>>,
+        rejected: tokio::sync::Mutex<HashSet<String>>,
+    }
+
+    struct VolumeWriteGate {
+        record_key: String,
+        entered: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+    }
+
+    struct VolumeHttpFixture {
+        state: Arc<VolumeHttpState>,
+        repository: Arc<OssSnapshotRepository>,
+        server: tokio::task::JoinHandle<std::io::Result<()>>,
+    }
+
+    impl Drop for VolumeHttpFixture {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    impl VolumeHttpFixture {
+        async fn new() -> anyhow::Result<Self> {
+            let state: Arc<VolumeHttpState> = Arc::default();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let endpoint = format!("http://{}", listener.local_addr()?);
+            let app = axum::Router::new()
+                .fallback(volume_http_storage)
+                .with_state(state.clone());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await });
+            let repository = Arc::new(OssSnapshotRepository::new(
+                Arc::new(OssClient::new(
+                    "bucket".into(),
+                    endpoint,
+                    "region".into(),
+                    "prefix".into(),
+                    CredentialSource::Static(object_store_operator::ResolvedCredential::new(
+                        "fixture-access".into(),
+                        "fixture-secret".into(),
+                        None,
+                        None,
+                    )?),
+                    Some(object_store_operator::AddressingStyle::Path),
+                )?),
+                SnapshotImageStoragePolicy::ObjectStorage,
+            ));
+            Ok(Self {
+                state,
+                repository,
+                server,
+            })
+        }
+
+        fn reopen(&self) -> OssSnapshotRepository {
+            OssSnapshotRepository::new(
+                self.repository.client.clone(),
+                SnapshotImageStoragePolicy::ObjectStorage,
+            )
+        }
+
+        fn record_key(id: &str) -> String {
+            format!(
+                "/bucket/prefix/{}",
+                OssSnapshotArtifactLayout::volume_record_key(id)
+            )
+        }
+
+        async fn pause_record_write(&self, id: &str) -> Arc<VolumeWriteGate> {
+            let gate = Arc::new(VolumeWriteGate {
+                record_key: Self::record_key(id),
+                entered: Default::default(),
+                resume: Default::default(),
+            });
+            *self.state.gate.lock().await = Some(gate.clone());
+            gate
+        }
+    }
+
+    async fn volume_http_storage(
+        axum::extract::State(state): axum::extract::State<Arc<VolumeHttpState>>,
+        method: axum::http::Method,
+        uri: axum::http::Uri,
+        headers: axum::http::HeaderMap,
+        bytes: bytes::Bytes,
+    ) -> axum::response::Response {
         use axum::{
-            body::{Body, Bytes},
-            extract::State,
-            http::{HeaderMap, Method, StatusCode, Uri},
+            body::Body,
+            http::{Method, StatusCode},
             response::{IntoResponse, Response},
-            Router,
         };
-        use std::collections::HashMap;
-        use tokio::sync::Mutex;
-        type Objects = Arc<Mutex<HashMap<String, (Bytes, String)>>>;
-        async fn storage(
-            State(objects): State<Objects>,
-            method: Method,
-            uri: Uri,
-            headers: HeaderMap,
-            bytes: Bytes,
-        ) -> Response {
-            let mut objects = objects.lock().await;
-            let key = uri.path().to_owned();
-            let current = objects.get(&key);
-            if let Some(expected) = headers.get("if-match") {
-                if current.map(|(_, etag)| etag.as_bytes()) != Some(expected.as_bytes()) {
-                    return StatusCode::PRECONDITION_FAILED.into_response();
+        let key = uri.path().to_owned();
+        if method == Method::PUT {
+            let gate = {
+                let mut gate = state.gate.lock().await;
+                if gate.as_ref().is_some_and(|gate| gate.record_key == key) {
+                    gate.take()
+                } else {
+                    None
                 }
+            };
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.resume.notified().await;
             }
-            if headers.contains_key("if-none-match") && current.is_some() {
+            if state.rejected.lock().await.contains(&key) {
+                return StatusCode::FORBIDDEN.into_response();
+            }
+        }
+        let mut objects = state.objects.lock().await;
+        let query: std::collections::HashMap<_, _> =
+            url::form_urlencoded::parse(uri.query().unwrap_or("").as_bytes())
+                .into_owned()
+                .collect();
+        if method == Method::GET && query.get("list-type").is_some_and(|value| value == "2") {
+            let prefix = query.get("prefix").map(String::as_str).unwrap_or("");
+            let after = query
+                .get("continuation-token")
+                .or_else(|| query.get("start-after"))
+                .map(String::as_str)
+                .unwrap_or("");
+            let limit: usize = query
+                .get("max-keys")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1000);
+            let mut keys: Vec<_> = objects
+                .keys()
+                .filter_map(|key| key.strip_prefix("/bucket/"))
+                .filter(|key| key.starts_with(prefix) && *key > after)
+                .collect();
+            keys.sort();
+            let truncated = keys.len() > limit;
+            keys.truncate(limit);
+            let entries = keys
+                .iter()
+                .map(|key| format!("<Contents><Key>{key}</Key><LastModified>2026-09-08T00:00:00.000Z</LastModified><ETag>fixture</ETag><Size>1</Size></Contents>"))
+                .collect::<String>();
+            let token = if truncated {
+                format!(
+                    "<NextContinuationToken>{}</NextContinuationToken>",
+                    keys.last().unwrap()
+                )
+            } else {
+                String::new()
+            };
+            return Response::builder().status(200).header("content-type", "application/xml")
+                .body(Body::from(format!("<ListBucketResult><IsTruncated>{truncated}</IsTruncated>{token}{entries}</ListBucketResult>"))).unwrap();
+        }
+        let current = objects.get(&key);
+        if let Some(expected) = headers.get("if-match") {
+            if current.map(|(_, etag)| etag.as_bytes()) != Some(expected.as_bytes()) {
                 return StatusCode::PRECONDITION_FAILED.into_response();
             }
-            match method {
-                Method::PUT => {
-                    let etag = format!("\"{}\"", uuid::Uuid::now_v7());
-                    objects.insert(key, (bytes, etag.clone()));
-                    Response::builder()
-                        .status(200)
-                        .header("etag", etag)
-                        .body(Body::empty())
+        }
+        if headers.contains_key("if-none-match") && current.is_some() {
+            return StatusCode::PRECONDITION_FAILED.into_response();
+        }
+        match method {
+            Method::PUT => {
+                let etag = format!("\"{}\"", uuid::Uuid::now_v7());
+                objects.insert(key, (bytes, etag.clone()));
+                Response::builder()
+                    .status(200)
+                    .header("etag", etag)
+                    .body(Body::empty())
+                    .unwrap()
+            }
+            Method::GET | Method::HEAD => match current {
+                Some((bytes, etag)) => Response::builder()
+                    .status(200)
+                    .header("etag", etag)
+                    .header("content-length", bytes.len())
+                    .body(if method == Method::HEAD {
+                        Body::empty()
+                    } else {
+                        Body::from(bytes.clone())
+                    })
+                    .unwrap(),
+                None => StatusCode::NOT_FOUND.into_response(),
+            },
+            Method::DELETE => {
+                assert!(
+                    !key.contains("/volumes/"),
+                    "volume records and aliases retain terminal ownership evidence"
+                );
+                objects.remove(&key);
+                StatusCode::NO_CONTENT.into_response()
+            }
+            _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+        }
+    }
+
+    fn http_volume(id: &str, name: &str, mode: VolumeMode) -> VolumeRecord {
+        VolumeRecord {
+            id: id.into(),
+            name: name.into(),
+            mode,
+            size_mb: 64,
+            status: VolumeStatus::Ready,
+            reserved_by_sandbox_id: None,
+            backing_image_config: None,
+            backing_layers: Vec::new(),
+            read_only_mounts: Vec::new(),
+            deleting: false,
+            delete_owner: None,
+            deletion_completed: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_volume_create_cannot_steal_an_unpublished_alias() -> anyhow::Result<()> {
+        for mode in [VolumeMode::Exclusive, VolumeMode::ReadOnly] {
+            for reuse in [false, true] {
+                let fixture = VolumeHttpFixture::new().await?;
+                let original = http_volume("vol_first", "contended-name", mode);
+                let competing = http_volume("vol_second", &original.name, mode);
+                if reuse {
+                    let previous = http_volume("vol_previous", &original.name, mode);
+                    fixture.repository.create_volume(previous.clone()).await?;
+                    let owner = uuid::Uuid::now_v7();
+                    fixture
+                        .repository
+                        .begin_volume_deletion(&previous.id, owner)
+                        .await?;
+                    fixture
+                        .repository
+                        .delete_volume(&previous.id, owner)
+                        .await?;
+                }
+                let gate = fixture.pause_record_write(&original.id).await;
+                let first = tokio::spawn({
+                    let repository = fixture.repository.clone();
+                    let record = original.clone();
+                    async move { repository.create_volume(record).await }
+                });
+                let boundary = tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    gate.entered.notified(),
+                )
+                .await;
+                if boundary.is_err() {
+                    first.abort();
+                    gate.resume.notify_one();
+                }
+                boundary?;
+                assert!(fixture
+                    .repository
+                    .read_volume_record(&original.id)
+                    .await?
+                    .is_none());
+                let second = fixture.reopen().create_volume(competing).await;
+                gate.resume.notify_one();
+                let first_result = first.await?;
+                first_result?;
+                assert!(
+                    matches!(second, Err(RepositoryError::VolumeNameConflict { .. })),
+                    "a second creator must not steal the first creator's unpublished name"
+                );
+                assert_eq!(
+                    fixture
+                        .repository
+                        .get_volume(&original.name)
+                        .await?
                         .unwrap()
-                }
-                Method::GET | Method::HEAD => match current {
-                    Some((bytes, etag)) => Response::builder()
-                        .status(200)
-                        .header("etag", etag)
-                        .header("content-length", bytes.len())
-                        .body(if method == Method::HEAD {
-                            Body::empty()
-                        } else {
-                            Body::from(bytes.clone())
-                        })
-                        .unwrap(),
-                    None => StatusCode::NOT_FOUND.into_response(),
-                },
-                Method::DELETE => {
-                    assert!(
-                        !key.contains("/aliases/"),
-                        "unconditional alias delete can erase a concurrent replacement"
-                    );
-                    objects.remove(&key);
-                    StatusCode::NO_CONTENT.into_response()
-                }
-                _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+                        .id,
+                    original.id
+                );
             }
         }
-        let objects: Objects = Arc::default();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let endpoint = format!("http://{}", listener.local_addr()?);
-        let app = Router::new().fallback(storage).with_state(objects.clone());
-        let server = tokio::spawn(async move { axum::serve(listener, app).await });
-        // Abort the fixture server on either success or assertion failure.
-        struct ServerGuard(tokio::task::JoinHandle<std::io::Result<()>>);
-        impl Drop for ServerGuard {
-            fn drop(&mut self) {
-                self.0.abort();
-            }
-        }
-        let _server_guard = ServerGuard(server);
-        let repository = OssSnapshotRepository::new(
-            Arc::new(OssClient::new(
-                "bucket".into(),
-                endpoint,
-                "region".into(),
-                "prefix".into(),
-                CredentialSource::Static(object_store_operator::ResolvedCredential::new(
-                    "fixture-access".into(),
-                    "fixture-secret".into(),
-                    None,
-                    None,
-                )?),
-                Some(object_store_operator::AddressingStyle::Path),
-            )?),
-            SnapshotImageStoragePolicy::ObjectStorage,
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn interrupted_volume_create_retains_its_original_alias_claim() -> anyhow::Result<()> {
+        let fixture = VolumeHttpFixture::new().await?;
+        let original = http_volume("vol_interrupted", "pending-name", VolumeMode::Exclusive);
+        let key = VolumeHttpFixture::record_key(&original.id);
+        fixture.state.rejected.lock().await.insert(key.clone());
+        assert!(fixture
+            .repository
+            .create_volume(original.clone())
+            .await
+            .is_err());
+        assert!(fixture
+            .repository
+            .read_volume_record(&original.id)
+            .await?
+            .is_none());
+        let fresh = fixture.reopen();
+        assert!(
+            matches!(
+                fresh
+                    .create_volume(http_volume("vol_other", &original.name, original.mode))
+                    .await,
+                Err(RepositoryError::VolumeNameConflict { .. })
+            ),
+            "a failed record write is not evidence of completed deletion"
         );
+        fixture.state.rejected.lock().await.remove(&key);
+        // Recovery requires the original ID and input; a fresh guessed ID cannot adopt it.
+        fresh.create_volume(original.clone()).await?;
+        assert_eq!(
+            fresh.get_volume(&original.name).await?.unwrap().id,
+            original.id
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn completed_volume_tombstones_prevent_resurrection_without_breaking_pages(
+    ) -> anyhow::Result<()> {
+        let fixture = VolumeHttpFixture::new().await?;
+        let repository = &fixture.repository;
+        let owner = uuid::Uuid::now_v7();
+        for index in 0..10 {
+            let record = http_volume(
+                &format!("vol_{index:03}"),
+                &format!("data-{index}"),
+                VolumeMode::Exclusive,
+            );
+            repository.create_volume(record.clone()).await?;
+            if [2, 6, 9].contains(&index) {
+                continue;
+            }
+            repository.begin_volume_deletion(&record.id, owner).await?;
+            if index == 0 {
+                let key = VolumeHttpFixture::record_key(&record.id);
+                fixture.state.rejected.lock().await.insert(key.clone());
+                assert!(repository.delete_volume(&record.id, owner).await.is_err());
+                assert!(
+                    !fixture
+                        .reopen()
+                        .get_volume(&record.id)
+                        .await?
+                        .unwrap()
+                        .deletion_completed
+                );
+                assert!(matches!(
+                    repository
+                        .create_volume(http_volume("vol_replacement", &record.name, record.mode))
+                        .await,
+                    Err(RepositoryError::VolumeNameConflict { .. })
+                ));
+                fixture.state.rejected.lock().await.remove(&key);
+            }
+            repository.delete_volume(&record.id, owner).await?;
+            assert!(repository.get_volume(&record.id).await?.is_none());
+            assert!(repository.get_volume(&record.name).await?.is_none());
+            let (terminal, etag) = repository
+                .read_volume_record_versioned(&record.id)
+                .await?
+                .unwrap();
+            assert!(terminal.deletion_completed);
+            assert!(terminal.backing_layers.is_empty());
+            assert!(repository.create_volume(record.clone()).await.is_err());
+            assert!(
+                matches!(
+                    repository
+                        .create_volume(http_volume(
+                            &format!("vol_alias_{index}"),
+                            &record.id,
+                            record.mode
+                        ))
+                        .await,
+                    Err(RepositoryError::VolumeNameConflict { .. })
+                ),
+                "a deleted ID must not become another volume's name"
+            );
+            assert!(repository.get_volume(&record.id).await?.is_none());
+            assert!(repository.put_volume(record.clone()).await.is_err());
+            assert!(repository
+                .reserve_volume(&record.id, "new-owner")
+                .await
+                .is_err());
+            repository.begin_volume_deletion(&record.id, owner).await?;
+            repository
+                .delete_volume(&record.id, uuid::Uuid::now_v7())
+                .await?;
+            assert_eq!(
+                repository
+                    .read_volume_record_versioned(&record.id)
+                    .await?
+                    .unwrap()
+                    .1,
+                etag,
+                "a completed retry must not rewrite terminal ownership evidence"
+            );
+        }
+        let fresh = fixture.reopen();
+        let first = fresh.list_volumes_page(None, 2).await?;
+        assert_eq!(
+            first
+                .records
+                .iter()
+                .map(|v| v.id.as_str())
+                .collect::<Vec<_>>(),
+            ["vol_002", "vol_006"]
+        );
+        assert_eq!(first.next_volume_id.as_deref(), Some("vol_006"));
+        let second = fresh
+            .list_volumes_page(first.next_volume_id.as_deref(), 2)
+            .await?;
+        assert_eq!(
+            second
+                .records
+                .iter()
+                .map(|v| v.id.as_str())
+                .collect::<Vec<_>>(),
+            ["vol_009"]
+        );
+        assert!(second.next_volume_id.is_none());
+        fresh.begin_volume_deletion("vol_009", owner).await?;
+        fresh.delete_volume("vol_009", owner).await?;
+        assert!(fresh
+            .list_volumes_page(Some("vol_006"), 1)
+            .await?
+            .records
+            .is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn volume_deletion_claim_and_alias_reuse_over_s3_http() -> anyhow::Result<()> {
+        let fixture = VolumeHttpFixture::new().await?;
+        let repository = &fixture.repository;
         let owner = uuid::Uuid::now_v7();
         for mode in [VolumeMode::Exclusive, VolumeMode::ReadOnly] {
             let record = VolumeRecord {
@@ -1853,6 +2247,7 @@ mod tests {
                 read_only_mounts: Vec::new(),
                 deleting: false,
                 delete_owner: None,
+                deletion_completed: false,
             };
             repository.create_volume(record.clone()).await?;
             assert!(repository.delete_volume(&record.id, owner).await.is_err());

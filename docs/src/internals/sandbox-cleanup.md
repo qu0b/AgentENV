@@ -101,18 +101,38 @@ node to bypass that requirement. Drain old catalog writers before cutover;
 rollback must preserve the claim protocol and this identity, in addition to the
 preceding sandbox/volume ownership contracts. The public API is unchanged.
 
-POSIX uses the catalog record lock to claim deletion and holds alias/record
-locks during final cleanup. Alias failures retain the record. OSS uses ETag
-conditional writes to claim deletion and retain ownership across retries. OSS
-keeps the deleted volume's name pointer until a later create reclaims it with
-an ETag conditional write; lookup returns no volume while its record is absent.
-It does not issue an unconditional alias DELETE, which could erase a replacement
-created concurrently. A name is not reclaimable while its old record is still
-present, including pending deletion. Volume IDs are unique lifetime identities
-and must never be reused. The pinned OpenDAL 0.55 S3 client requires
-`if_not_exists(true)` for create-if-absent writes; `if_none_match("*")` is rejected
-by its capability checks before any request. The conditional-write helper now
-uses the supported operation.
+Completed deletion is retained in the original catalog key with
+`deletionCompleted=true`, `deleting=true`, `status=failed` and the original
+`deleteOwner`. Backing layer references are cleared. Both backends hide these
+terminal records from ID/name lookup and active inventory, and page through
+terminal keys without shortening visible pages. They reject a create at the
+same ID and refuse attempts to reopen or mount it. Deleted IDs also remain
+reserved in the name namespace, so an old-ID retry cannot resolve a new volume.
+These records are ownership
+evidence, not rebuildable cache. Keep them until a separately qualified retention
+protocol can preserve ID uniqueness and name ownership; do not delete them as GC.
+Listing currently scans retained terminal keys, so large-catalog cost and a
+scalable active-record index remain work to qualify before fleet-scale use.
+
+POSIX completes deletion under alias/record locks and syncs the terminal write.
+OSS uses an ETag conditional write in the original record key. The name pointer
+remains until a later create replaces it under the POSIX alias lock or an OSS
+ETag condition. A name pointing to another ID is reclaimable only when that
+ID has a valid completed tombstone with the matching name. Missing records
+cannot authorize takeover: the first create may have claimed its name but not
+yet published its record. This also protects a name after a failed record write.
+Known original create inputs/IDs can finish interrupted publication; a fresh
+ID cannot adopt it. Automatic discovery/recovery of such interrupted creates
+is not implemented here. Legacy aliases whose records were physically removed
+require reconciliation using original evidence, not inference from absence.
+
+Drain all older catalog writers before this private format cutover. Older
+readers can expose terminal records as failed volumes, and older deleters can
+erase their identity evidence. Rollback requires a terminal-aware binary or
+verified backport. Preserve the existing cleanup-owner DB, catalog and original
+backing state together. The public API is unchanged. The pinned OpenDAL 0.55 S3
+client requires `if_not_exists(true)` for create-if-absent writes;
+`if_none_match("*")` is rejected by its capability checks before any request.
 
 This protects cleanup in the local state that began deletion. It does not prove
 that every historical cache copy on every node has been erased, nor establish
@@ -222,9 +242,20 @@ exercises the actual OpenDAL S3 client through creation, claimed deletion,
 reservation rejection and name reuse; a delayed old delete preserves the new
 name binding. It is a protocol fixture, not live object-storage qualification.
 
-Restoring the preceding manager's catalog-first deletion and swallowed filesystem
+Restoring `0a52fede`'s manager catalog-first deletion and swallowed filesystem
 error (adapted only to the new two-phase repository API) makes the process test
 fail at its false-success assertion. Restoring the unsupported S3 write option
 fails the HTTP test at OpenDAL's capability check. The fixed revision passes
-226 relevant Rust tests; no provider call or native VM is involved in these new
+230 relevant Rust tests; no provider call or native VM is involved in these new
 checks.
+
+The shared HTTP fixture pauses the first record PUT after its alias is committed
+while another repository instance attempts the same name. It covers both volume
+modes and both fresh/reused names. A failed record write keeps its alias claim
+across a fresh repository instance; only the original known ID/input can finish.
+Real POSIX and HTTP-backed OSS catalog tests verify hidden terminal records,
+refused ID reuse/mount/update, complete pages across terminal keys, name reuse,
+and retained pending deletion when its terminal write fails. Restoring the actual
+`5feaf11b` OSS alias-claim method fails both concurrent and interrupted-create
+assertions. These tests establish local/protocol behavior, not live object-store
+or fleet-wide cleanup qualification.
