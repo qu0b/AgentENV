@@ -10,10 +10,10 @@
 //! is recontainerized as ZFile — the live runtime keeps referencing the raw
 //! sealed layer written by the daemon.
 //!
-use std::ffi::OsStr;
+use std::ffi::{CString, OsStr};
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -248,12 +248,54 @@ fn restack_target_upper_data_path(live_runtime_image_config_path: &Path) -> Resu
     Ok(PathBuf::from(image_config.upper.data))
 }
 
-fn on_same_filesystem(src_path: &Path, dst_dir: &Path) -> Result<bool> {
-    let src_meta = fs::metadata(src_path)
-        .with_context(|| format!("stat restack source path {}", src_path.display()))?;
-    let dst_meta = fs::metadata(dst_dir)
-        .with_context(|| format!("stat restack destination dir {}", dst_dir.display()))?;
-    Ok(src_meta.dev() == dst_meta.dev())
+fn mount_id(path: &Path) -> Result<Option<u64>> {
+    let path_c = CString::new(path.as_os_str().as_bytes()).context("mount path contains NUL")?;
+    // Device IDs identify the filesystem, not the mount. A bind mount shares
+    // st_dev with its source, but rename between the mounts still returns EXDEV.
+    // STATX_MNT_ID is available since Linux 5.8; absent support must choose the
+    // existing source-adjacent sealing/copy path, never assume rename is safe.
+    let mut stat: nix::libc::statx = unsafe { std::mem::zeroed() };
+    // SAFETY: path_c is NUL-terminated and stat is a valid writable statx buffer.
+    let result = unsafe {
+        nix::libc::statx(
+            nix::libc::AT_FDCWD,
+            path_c.as_ptr(),
+            0,
+            nix::libc::STATX_MNT_ID,
+            &mut stat,
+        )
+    };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(nix::libc::ENOSYS) {
+            return Ok(None);
+        }
+        return Err(error).with_context(|| format!("inspect restack mount {}", path.display()));
+    }
+    Ok((stat.stx_mask & nix::libc::STATX_MNT_ID != 0).then_some(stat.stx_mnt_id))
+}
+
+fn on_same_mount(src_path: &Path, dst_dir: &Path) -> Result<bool> {
+    let source = mount_id(src_path)?;
+    let destination = mount_id(dst_dir)?;
+    Ok(source.is_some() && source == destination)
+}
+
+fn reserve_source_adjacent_snapshot(upper_data_path: &Path) -> Result<PathBuf> {
+    let parent = upper_data_path
+        .parent()
+        .context("restack upper has no parent directory")?;
+    // The daemon can keep previous sealed layers open and in its live config.
+    // Never overwrite a fixed sibling name during a later capture generation.
+    let temporary = tempfile::Builder::new()
+        .prefix(".snapshot-")
+        .suffix(".commit")
+        .tempfile_in(parent)
+        .context("reserve source-adjacent snapshot layer")?;
+    temporary
+        .into_temp_path()
+        .keep()
+        .context("retain source-adjacent snapshot reservation")
 }
 
 fn write_bytes_atomically(path: &Path, bytes: &[u8], description: &str) -> Result<()> {
@@ -515,24 +557,12 @@ async fn capture_live_overlaybd_snapshot(
         .context("resolve restack source upper path")?;
     let snapshot_layer_path = output_dir.join(snapshot_layer_file_name);
     prepare_specific_snapshot_layer_path(&snapshot_layer_path).await?;
-    let live_snapshot_layer_path = if on_same_filesystem(&live_upper_data_path, output_dir)
-        .context("validate restack snapshot filesystem precondition")?
+    let live_snapshot_layer_path = if on_same_mount(&live_upper_data_path, output_dir)
+        .context("validate restack snapshot mount precondition")?
     {
         snapshot_layer_path.clone()
     } else {
-        let live_snapshot_layer_path = live_upper_data_path
-            .parent()
-            .context("restack source upper path has no parent directory")?
-            .join(snapshot_layer_file_name);
-        prepare_specific_snapshot_layer_path(&live_snapshot_layer_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "prepare same-filesystem restack snapshot layer {}",
-                    live_snapshot_layer_path.display()
-                )
-            })?;
-        live_snapshot_layer_path
+        reserve_source_adjacent_snapshot(&live_upper_data_path)?
     };
 
     let descriptor = UblkDeviceManager::global()
@@ -831,6 +861,79 @@ mod tests {
     use bytes::Bytes;
     use firecracker_client::models::DirtyMemoryRange;
     use serde_json::json;
+
+    #[test]
+    fn source_adjacent_capture_generations_never_replace_an_earlier_layer() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let upper = temp.path().join("upper.data");
+        fs::write(&upper, "active upper")?;
+        let first = reserve_source_adjacent_snapshot(&upper)?;
+        fs::write(&first, "first sealed generation")?;
+        let second = reserve_source_adjacent_snapshot(&upper)?;
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), upper.parent());
+        assert_eq!(second.parent(), upper.parent());
+        assert_eq!(fs::read_to_string(&first)?, "first sealed generation");
+        assert_eq!(fs::metadata(&second)?.len(), 0);
+        assert_eq!(fs::read_to_string(&upper)?, "active upper");
+        Ok(())
+    }
+
+    #[test]
+    fn restack_mount_preflight_handles_symlinks_and_lookup_errors() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let upper = temp.path().join("upper.data");
+        fs::write(&upper, "still writable")?;
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&upper, &alias)?;
+        assert!(on_same_mount(&upper, temp.path())?);
+        assert!(on_same_mount(&alias, temp.path())?);
+        assert!(on_same_mount(&upper, &temp.path().join("missing")).is_err());
+        assert!(on_same_mount(&upper.join("not-a-directory"), temp.path()).is_err());
+        assert_eq!(fs::read_to_string(&upper)?, "still writable");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN; creates a private mount namespace"]
+    fn restack_mount_preflight_rejects_bind_mount_with_matching_device_id() -> Result<()> {
+        std::thread::spawn(|| -> Result<()> {
+            use nix::mount::{mount, umount2, MntFlags, MsFlags};
+            nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS)?;
+            mount::<str, str, str, str>(
+                None,
+                "/",
+                None,
+                MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+                None,
+            )?;
+            let temp = tempfile::tempdir()?;
+            let source = temp.path().join("source");
+            let target = temp.path().join("bind");
+            fs::create_dir(&source)?;
+            fs::create_dir(&target)?;
+            let upper = source.join("upper.data");
+            fs::write(&upper, "not sealed")?;
+            mount::<Path, Path, str, str>(Some(&source), &target, None, MsFlags::MS_BIND, None)?;
+            struct MountGuard(PathBuf);
+            impl Drop for MountGuard {
+                fn drop(&mut self) {
+                    let _ = umount2(&self.0, MntFlags::MNT_DETACH);
+                }
+            }
+            let _mount = MountGuard(target.clone());
+            assert_eq!(fs::metadata(&upper)?.dev(), fs::metadata(&target)?.dev());
+            assert!(
+                !on_same_mount(&upper, &target)?,
+                "same device does not authorize cross-mount rename"
+            );
+            assert!(on_same_mount(&target.join("upper.data"), &target)?);
+            assert_eq!(fs::read_to_string(&upper)?, "not sealed");
+            Ok(())
+        })
+        .join()
+        .map_err(|_| anyhow::anyhow!("mount preflight test thread panicked"))?
+    }
 
     #[test]
     fn dirty_ranges_to_segment_mappings_splits_large_ranges() {

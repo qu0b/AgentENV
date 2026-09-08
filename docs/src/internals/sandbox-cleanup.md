@@ -127,6 +127,31 @@ These do not qualify host resource erasure, daemon recovery or production load.
 
 ## Acquisition-owned device operations
 
+### Snapshot sealing across mount boundaries
+
+Native candidate qualification with a private bind-mounted `/tmp` exposed a
+restack preflight bug: the writable upper and snapshot output had equal `st_dev`
+values but belonged to different mounts. The direct rename failed with `EXDEV`
+after sealing had mutated the live image. The template build correctly failed;
+it did not establish a usable snapshot.
+
+The preflight now compares `STATX_MNT_ID`, which identifies the containing mount
+rather than its filesystem device ([Linux statx documentation](https://man7.org/linux/man-pages/man2/statx.2.html)).
+Different mounts, or unavailable mount-ID support, select the existing path that
+seals adjacent to the writable upper and then atomically copies the layer into
+the snapshot directory. Lookup errors propagate before sealing. Each adjacent
+generation reserves its own filename; later captures cannot replace a previous
+live lower by reusing a fixed sibling path. Snapshot config/schema and the daemon
+protocol are unchanged. Mount changes racing the preflight, interrupted copying
+and broader durable publication/recovery still require their ownership contracts.
+
+Local validation passes 451 targeted tests plus clippy/formatting. Five privileged
+cases are excluded locally; the lab passed the four existing network/capability
+cases and the new private bind-mount preflight case. Restoring device-number
+comparison makes the bind-mount case fail on that host. Native template build and
+pause/resume must also be rerun with the corrected candidate before qualifying
+this change as a working native lifecycle.
+
 Every daemon device acquisition returns a fresh UUID receipt paired with its
 kernel device number. Distinct shared acquisitions receive distinct receipts,
 even when they use the same underlying device. Release, resize and restack
