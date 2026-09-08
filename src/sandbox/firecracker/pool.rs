@@ -14,7 +14,7 @@ use nix::libc;
 use tempfile::TempDir;
 use tokio::runtime::{Builder, Runtime};
 use tracing::{debug, info, warn};
-use warm_pool::{PoolMaintenanceAction, WarmPool};
+use warm_pool::{MaintenanceOutcome, PoolMaintenanceAction, WarmPool};
 
 use super::config::create_firecracker_work_dir;
 use super::FirecrackerInstance;
@@ -45,6 +45,7 @@ fn register_process_exit_hook(handler: extern "C" fn()) -> i32 {
 pub(crate) struct WarmFirecracker {
     resources: Option<WarmResources>,
     cleanup_pending: Arc<Mutex<WarmCleanupState>>,
+    owns_capacity: bool,
 }
 
 #[derive(Default)]
@@ -60,12 +61,25 @@ struct WarmResources {
 }
 
 impl WarmFirecracker {
+    #[cfg(test)]
     fn new(resources: WarmResources, cleanup_pending: &Arc<Mutex<WarmCleanupState>>) -> Self {
-        cleanup_pending
+        let mut owner = Self::reserve(cleanup_pending, usize::MAX).unwrap();
+        owner.resources = Some(resources);
+        owner
+    }
+
+    fn reserve(cleanup_pending: &Arc<Mutex<WarmCleanupState>>, limit: usize) -> Result<Self> {
+        let mut state = cleanup_pending
             .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .outstanding += 1;
-        Self::from_pending(resources, cleanup_pending)
+            .unwrap_or_else(|err| err.into_inner());
+        anyhow::ensure!(state.outstanding < limit,
+            "warm Firecracker capacity is occupied by {} ready, creating or unresolved owners (limit {limit})", state.outstanding);
+        state.outstanding += 1;
+        Ok(Self {
+            resources: None,
+            cleanup_pending: Arc::clone(cleanup_pending),
+            owns_capacity: true,
+        })
     }
 
     fn from_pending(
@@ -75,11 +89,13 @@ impl WarmFirecracker {
         Self {
             resources: Some(resources),
             cleanup_pending: Arc::clone(cleanup_pending),
+            owns_capacity: true,
         }
     }
 
     fn release_ownership(&mut self) -> WarmResources {
         let resources = self.resources.take().expect("owned warm resources");
+        self.owns_capacity = false;
         self.cleanup_pending
             .lock()
             .unwrap_or_else(|err| err.into_inner())
@@ -109,6 +125,13 @@ impl Drop for WarmFirecracker {
                 .unwrap_or_else(|err| err.into_inner())
                 .pending
                 .push(resources);
+        } else if self.owns_capacity {
+            // Cancellation/failure before allocating resources frees only the
+            // reserved warm capacity. A populated owner stays counted in pending.
+            self.cleanup_pending
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .outstanding -= 1;
         }
     }
 }
@@ -213,6 +236,9 @@ impl FirecrackerPool {
         self.pool.start_maintenance_worker(move || {
             if let Err(err) = self.run_maintenance_cycle() {
                 warn!(error = %err, "firecracker pool maintenance cycle failed");
+                MaintenanceOutcome::Retry
+            } else {
+                MaintenanceOutcome::Complete
             }
         });
     }
@@ -378,7 +404,10 @@ impl FirecrackerPool {
             cleanup_failures.extend(failures);
 
             if saw_failure {
-                break;
+                return Err(anyhow!(
+                    "firecracker pool refill failed: {}",
+                    cleanup_failures.join(" | ")
+                ));
             }
             remaining -= batch_size;
         }
@@ -411,6 +440,7 @@ impl FirecrackerPool {
                 Err(err) => {
                     saw_failure = true;
                     debug!(error = %err, "skipping firecracker pool refill attempt");
+                    cleanup_failures.push(err.to_string());
                 }
             }
         }
@@ -420,6 +450,9 @@ impl FirecrackerPool {
 
     #[tracing::instrument(skip(self))]
     async fn create_warm_async(&self) -> Result<WarmFirecracker> {
+        // Reserve under the ownership lock before any filesystem, network or
+        // process allocation. Pending cleanup consumes the same existing cap.
+        let mut warm = self.reserve_warm_capacity()?;
         let work_dir = create_firecracker_work_dir(self.firecracker_work_base_dir.as_deref())
             .context("firecracker pool: create work dir")?;
         let slot = NetworkManager::global()
@@ -427,28 +460,32 @@ impl FirecrackerPool {
             .context("firecracker pool: allocate network slot")?;
 
         let namespace = slot.namespace_path();
-        self.start_warm(slot, work_dir, Some(namespace)).await
+        warm.resources = Some(WarmResources {
+            fc_instance: FirecrackerInstance::new(work_dir.path().to_path_buf()),
+            slot: Some(slot),
+            work_dir,
+        });
+        self.start_warm(warm, Some(namespace)).await
+    }
+
+    fn reserve_warm_capacity(&self) -> Result<WarmFirecracker> {
+        anyhow::ensure!(
+            !self.pool.is_shutting_down(),
+            "warm Firecracker pool is shutting down"
+        );
+        WarmFirecracker::reserve(&self.cleanup_pending, self.pool.config().high_watermark)
     }
 
     async fn start_warm(
         &self,
-        slot: Slot,
-        work_dir: TempDir,
+        mut warm: WarmFirecracker,
         namespace: Option<PathBuf>,
     ) -> Result<WarmFirecracker> {
-        let stdout_path = warm_stdout_path(work_dir.path());
-        let stderr_path = warm_stderr_path(work_dir.path());
-        let mut warm = WarmFirecracker::new(
-            WarmResources {
-                fc_instance: FirecrackerInstance::new(work_dir.path().to_path_buf()),
-                slot: Some(slot),
-                work_dir,
-            },
-            &self.cleanup_pending,
-        );
         // Publish cleanup ownership before the first await, including the
         // launcher's outcome receiver while its thread is still starting.
         let resources = warm.resources.as_mut().expect("owned warm resources");
+        let stdout_path = warm_stdout_path(resources.work_dir.path());
+        let stderr_path = warm_stderr_path(resources.work_dir.path());
         resources
             .fc_instance
             .spawn_with_netns(

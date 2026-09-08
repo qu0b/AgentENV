@@ -5,7 +5,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use index_set::BitSet;
 use index_set::{slot_count, AtomicBitSet, SharedBitSet};
 use ipnetwork::Ipv4Network;
@@ -162,6 +162,9 @@ impl NetworkManager {
         self.pool.start_maintenance_worker(move || {
             if let Err(err) = self.run_pool_maintenance_cycle() {
                 warn!(error = %err, "network pool maintenance cycle failed");
+                warm_pool::MaintenanceOutcome::Retry
+            } else {
+                warm_pool::MaintenanceOutcome::Complete
             }
         });
     }
@@ -476,8 +479,7 @@ impl NetworkManager {
                     let maybe_slot = match self.allocate_fresh_slot() {
                         Ok(slot) => Some(slot),
                         Err(err) => {
-                            debug!(error = %err, "skipping pool refill attempt");
-                            break;
+                            return Err(err).context("network pool refill failed");
                         }
                     };
 

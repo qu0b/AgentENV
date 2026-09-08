@@ -140,6 +140,15 @@ The network subsystem is managed by a process-wide `NetworkManager` and per-slot
 
 Snapshot resume can also use `[pool.firecracker]` to pre-spawn `(network slot, Firecracker process)` pairs. A warm entry transfers its network slot, process, and Firecracker CWD to the resumed sandbox, which avoids the spawn and API-socket wait in the resume critical path. `[pool.block]` controls the ublk daemon's overlaybd warm-device pool; it shares the same top-level watermarks but performs async refill from request paths because reusable block devices are image/size-specific.
 
+The Firecracker pool reserves capacity before preparing each entry. Ready,
+creating and cleanup-pending warm owners all count against `[pool].high_watermark`;
+unfinished cleanup cannot make room for another warm process. Successful transfer
+to a native sandbox releases that warm capacity. Network and Firecracker
+maintenance workers back off failed/incomplete cycles from 100 ms to 30 seconds,
+and check idle pools every 30 seconds for cleanup arriving without new demand.
+The existing `maintenance_enabled` controls remain in effect. This scheduling is
+separate from block-device refill and does not establish restart reconciliation.
+
 ### Observability Data Flow
 
 The node observability path combines request-time host collection with request-time projection:

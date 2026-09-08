@@ -74,10 +74,9 @@ reservations. They cover cancellation during launch/readiness, shutdown and
 overflow cleanup, repeated failed/cancelled retries, continued independent
 cleanup, network ownership errors, synchronous cleanup after Tokio destruction,
 successful handoff, and concurrent shutdown. These establish in-process
-ownership, not KVM or kernel network cleanup. Pending ownership is not durable;
-maintenance retries depend on maintenance activity or explicit shutdown retry.
-Retry cadence/backoff, pending-capacity limits, abnormal native sandbox drop,
-lost-launch reconciliation and target-host failures remain separate acceptance
+ownership, not KVM or kernel network cleanup. Pending ownership is not durable.
+Maintenance scheduling and warm capacity bounds are described below. Abnormal
+native sandbox drop, lost-launch reconciliation and target-host failures remain separate acceptance
 work. No installed service or public/persisted schema is changed by this fix.
 
 Validation for this round: 97 Firecracker, 71 network, 3 ublk wrapper, 10
@@ -86,6 +85,45 @@ daemon tests pass (439 distinct cases). Four privileged network/capability cases
 remain ignored. All-target/all-feature clippy with warnings denied and workspace
 formatting pass. Reintroducing continued cleanup after failed stop and removing
 the outstanding-owner shutdown check causes three focused regression failures.
+
+### Maintenance retry scheduling and warm capacity
+
+The generic network/Firecracker maintenance worker now receives an explicit
+`Complete` or `Retry` outcome. Both owners propagate refill failures. Failed
+cycles, callback panics and unfinished watermark work with no size progress
+schedule exponential backoff, starting at 100 ms and capped at 30 seconds.
+New demand cannot bypass a retry deadline. Successful progress resets backoff.
+Idle pools also run maintenance every 30 seconds, so cleanup queued after the
+last callback does not depend on future customer traffic. Existing disabled
+maintenance controls still disable the worker. No new flags are introduced.
+
+Shutdown wakes a retry/idle wait and joins the active callback. Startup publishes
+the worker handle under the same mutex used by shutdown and rejects already
+shutting-down pools. Joining may still wait for the active resource operation;
+the retry-delay cap is not a deadline for kernel I/O or complete shutdown.
+Recovering the maintenance callback after panic keeps scheduling alive; it does
+not establish that an interrupted native effect was rolled back or reconciled.
+
+Warm Firecracker creation reserves capacity atomically before directory,
+network or process allocation. Ready, creating and unresolved warm owners share
+the existing high-watermark limit. Dropping an empty reservation after failed
+preparation returns its capacity; a populated failed owner stays counted until
+cleanup succeeds. Successful handoff to a native sandbox releases only its warm
+capacity. Concurrent creators cannot overbook this limit. This bound covers warm
+Firecracker owners, not all network cleanup debt, active sandboxes, daemon receipts
+or resources surviving server death; those retain their separate ownership and
+admission/reconciliation requirements.
+
+Validation: 100 Firecracker, 71 network, 3 ublk wrapper, 10 extra-drive, 144
+orchestrator, 4 capability-launcher, 20 generic warm-pool and 97 daemon tests
+pass (449 distinct cases). Four privileged cases remain ignored. Clippy for all
+affected targets/features with warnings denied and workspace formatting pass.
+Real worker-thread tests verify demand during backoff, idle cleanup without
+requests, panic retry, shutdown joining and inert manager lookup. Capacity tests
+exercise concurrent reservation, failed preparation and unresolved owner retention
+before any host network allocation. Removing scheduling protections causes four
+regression failures; weakening capacity/empty-reservation cleanup causes three.
+These do not qualify host resource erasure, daemon recovery or production load.
 
 ## Acquisition-owned device operations
 

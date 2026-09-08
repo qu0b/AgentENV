@@ -12,6 +12,31 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+/// A resource owner must report failures even when idle watermarks are met.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaintenanceOutcome {
+    Complete,
+    Retry,
+}
+
+#[derive(Clone, Copy)]
+struct MaintenanceTiming {
+    retry_initial: Duration,
+    retry_max: Duration,
+    idle_poll: Duration,
+}
+
+impl Default for MaintenanceTiming {
+    fn default() -> Self {
+        Self {
+            retry_initial: Duration::from_millis(100),
+            retry_max: Duration::from_secs(30),
+            idle_poll: Duration::from_secs(30),
+        }
+    }
+}
 
 /// Action computed by watermark logic for the maintenance worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -310,9 +335,20 @@ impl<T: Send> WarmPool<T> {
     /// create/delete operations.
     pub fn start_maintenance_worker<F>(&'static self, run_cycle: F)
     where
-        F: Fn() + Send + 'static,
+        F: Fn() -> MaintenanceOutcome + Send + 'static,
     {
-        if !self.config.maintenance_enabled {
+        // Global manager lookup calls this repeatedly, including during cleanup.
+        // A running/disabled/stopping worker needs no lifecycle-lock acquisition.
+        if !self.config.maintenance_enabled
+            || self.is_shutting_down()
+            || self.maintenance_started.load(Ordering::Acquire)
+        {
+            return;
+        }
+        // Publish the handle under the same mutex shutdown uses to join it.
+        // Otherwise shutdown can miss a worker that is still starting.
+        let mut worker = self.maintenance_worker.lock().unwrap();
+        if !self.config.maintenance_enabled || self.is_shutting_down() {
             return;
         }
         if self.maintenance_started.swap(true, Ordering::AcqRel) {
@@ -321,10 +357,10 @@ impl<T: Send> WarmPool<T> {
 
         match std::thread::Builder::new()
             .name("warm-pool-maintenance".to_string())
-            .spawn(move || self.maintenance_worker_loop(run_cycle))
+            .spawn(move || self.maintenance_worker_loop(run_cycle, MaintenanceTiming::default()))
         {
             Ok(handle) => {
-                *self.maintenance_worker.lock().unwrap() = Some(handle);
+                *worker = Some(handle);
                 self.request_maintenance();
             }
             Err(err) => {
@@ -334,48 +370,77 @@ impl<T: Send> WarmPool<T> {
         }
     }
 
-    fn maintenance_worker_loop<F>(&self, run_cycle: F)
+    fn maintenance_worker_loop<F>(&self, run_cycle: F, timing: MaintenanceTiming)
     where
-        F: Fn(),
+        F: Fn() -> MaintenanceOutcome,
     {
         let mut has_immediate_work = false;
+        let mut retry_at = None;
+        let mut retry_delay = timing.retry_initial;
+        let mut idle_at = Instant::now() + timing.idle_poll;
         loop {
-            if !has_immediate_work {
-                let mut signal = self.maintenance_signal.lock().unwrap();
-                while !signal.stop && !signal.pending {
-                    signal = self.maintenance_cv.wait(signal).unwrap();
+            let mut signal = self.maintenance_signal.lock().unwrap();
+            loop {
+                if signal.stop || self.is_shutting_down() {
+                    return;
                 }
-                if signal.stop {
+                let now = Instant::now();
+                // New demand cannot bypass a failure backoff. Shutdown can.
+                let deadline = if let Some(deadline) = retry_at {
+                    deadline
+                } else if signal.pending || has_immediate_work {
+                    break;
+                } else {
+                    idle_at
+                };
+                if now >= deadline {
                     break;
                 }
-                signal.pending = false;
+                signal = self
+                    .maintenance_cv
+                    .wait_timeout(signal, deadline - now)
+                    .unwrap()
+                    .0;
             }
+            signal.pending = false;
+            drop(signal);
 
             if self.is_shutting_down() {
                 break;
             }
 
-            run_cycle();
+            let before = self.len();
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&run_cycle))
+                .unwrap_or_else(|_| {
+                    tracing::warn!(
+                        "warm pool maintenance callback panicked; retaining retry scheduling"
+                    );
+                    MaintenanceOutcome::Retry
+                });
 
             if self.is_shutting_down() {
                 break;
             }
 
-            has_immediate_work = {
-                let pool_len = self.pool.lock().unwrap().len();
-                !matches!(
-                    self.compute_maintenance_action(pool_len),
-                    PoolMaintenanceAction::Idle
-                )
-            };
+            let after = self.len();
+            has_immediate_work = !matches!(
+                self.compute_maintenance_action(after),
+                PoolMaintenanceAction::Idle
+            );
+            let now = Instant::now();
+            idle_at = now + timing.idle_poll;
+            // Also protect older callbacks that swallow an allocation error.
+            if outcome == MaintenanceOutcome::Retry || (has_immediate_work && before == after) {
+                retry_at = Some(now + retry_delay);
+                retry_delay = retry_delay.saturating_mul(2).min(timing.retry_max);
+            } else {
+                retry_at = None;
+                retry_delay = timing.retry_initial;
+            }
         }
     }
 
     fn stop_maintenance_worker(&self) {
-        if !self.maintenance_started.load(Ordering::Acquire) {
-            return;
-        }
-
         {
             let mut signal = self.maintenance_signal.lock().unwrap();
             signal.stop = true;
@@ -390,6 +455,9 @@ impl<T: Send> WarmPool<T> {
         }
     }
 }
+
+#[cfg(test)]
+mod maintenance_tests;
 
 #[cfg(test)]
 mod tests {
