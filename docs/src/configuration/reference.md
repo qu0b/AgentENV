@@ -283,6 +283,14 @@ Sandbox lifecycle management.
 
 ## `[pool]`
 
+Application configuration files may omit this section or individual component
+sections. The server and its ublk daemon both keep block pooling enabled by
+default; set `[pool.block].enabled = false` explicitly to disable it. A daemon
+started independently without an application config still requires
+`--enable-pool`. Keep the daemon and server from the same release: an older
+daemon can interpret an omitted block section as disabled and reject snapshot
+resume with `warm pool not enabled`.
+
 Shared process-wide warm-pool defaults used by network slots, block devices, and pre-spawned Firecracker processes. Pools prewarm to the low watermark, then grow the refill target geometrically toward the high watermark when real acquisitions drain the pool.
 
 | Key | Type | Default | Description |

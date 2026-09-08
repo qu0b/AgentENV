@@ -120,7 +120,11 @@ fn load_pool_config(
 
     let common = config.pool.as_ref();
     let pool = common.and_then(|pool| pool.block.as_ref());
-    let enabled = pool.and_then(|pool| pool.enabled).unwrap_or(force_enable);
+    // A supplied application config is partial: AppConfig defaults block
+    // pooling to true even when [pool] or [pool.block] is absent. The server
+    // relies on that resolved value for acquire/release RPCs. Standalone
+    // daemon invocations without an application config still opt in above.
+    let enabled = pool.and_then(|pool| pool.enabled).unwrap_or(true);
     if !enabled {
         return Ok(None);
     }
@@ -410,4 +414,50 @@ fn pidfd_open(pid: nix::unistd::Pid) -> Result<OwnedFd> {
         return Err(err).context("pidfd_open");
     }
     Ok(unsafe { OwnedFd::from_raw_fd(ret as i32) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_application_config_keeps_default_block_pool_enabled() -> Result<()> {
+        for text in ["", "[pool]\nlow_watermark = 1\nhigh_watermark = 2\n"] {
+            let config: DaemonTomlConfig = toml::from_str(text)?;
+            let pool = load_pool_config(Some(&config), false, &PoolConfigOverrides::default())?
+                .expect("application config defaults to an enabled block pool");
+            assert_eq!(pool.low_watermark, if text.is_empty() { 2 } else { 1 });
+            assert_eq!(pool.high_watermark, if text.is_empty() { 64 } else { 2 });
+            assert!(!pool.maintenance_enabled);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_application_pool_disable_is_preserved() -> Result<()> {
+        let config: DaemonTomlConfig = toml::from_str("[pool.block]\nenabled = false\n")?;
+        for force_enable in [false, true] {
+            assert!(load_pool_config(
+                Some(&config),
+                force_enable,
+                &PoolConfigOverrides::default()
+            )?
+            .is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn standalone_daemon_still_requires_pool_opt_in() -> Result<()> {
+        let overrides = PoolConfigOverrides {
+            low_watermark: Some(0),
+            high_watermark: Some(1),
+            startup_prewarm: Some(false),
+        };
+        assert!(load_pool_config(None, false, &overrides)?.is_none());
+        let pool = load_pool_config(None, true, &overrides)?.expect("explicit standalone pool");
+        assert_eq!((pool.low_watermark, pool.high_watermark), (0, 1));
+        assert!(!pool.startup_prewarm);
+        Ok(())
+    }
 }
