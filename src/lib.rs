@@ -1,3 +1,4 @@
+mod allocation;
 pub mod api;
 pub mod api_key;
 pub mod cfg;

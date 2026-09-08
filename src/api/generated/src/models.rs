@@ -94,6 +94,42 @@ pub struct NodesNodeIdGetQueryParams {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxAllocationsAllocationIdDeleteHeaderParams {
+    pub x_agentenv_allocation_owner: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxAllocationsAllocationIdDeletePathParams {
+    pub allocation_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxAllocationsAllocationIdGetHeaderParams {
+    pub x_agentenv_allocation_owner: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxAllocationsAllocationIdGetPathParams {
+    pub allocation_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxAllocationsAllocationIdPostHeaderParams {
+    pub x_agentenv_allocation_owner: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxAllocationsAllocationIdPostPathParams {
+    pub allocation_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SandboxesGetQueryParams {
     /// Metadata query used to filter the sandboxes (e.g. \"user=abc&app=prod\"). Each key and values must be URL encoded.
     #[serde(rename = "metadata")]
@@ -4956,6 +4992,388 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<Sandbox> {
                     }
                     std::result::Result::Err(err) => std::result::Result::Err(format!(
                         r#"Unable to convert header value '{value}' into Sandbox - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxAllocation {
+    /// Note: inline enums are not fully supported by openapi-generator
+    #[serde(rename = "version")]
+    pub version: i32,
+
+    #[serde(rename = "ownerId")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub owner_id: String,
+
+    #[serde(rename = "allocationId")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub allocation_id: String,
+
+    #[serde(rename = "sandboxId")]
+    pub sandbox_id: Nullable<String>,
+
+    #[serde(rename = "requestDigest")]
+    pub request_digest: Nullable<String>,
+
+    /// Settled means the create handler ended, not that the guest was deleted. Interrupted requires host reconciliation; an empty in-memory inventory is insufficient.
+    /// Note: inline enums are not fully supported by openapi-generator
+    #[serde(rename = "state")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub state: String,
+
+    /// Prevents a later request from claiming this key. An already pending operation is allowed to settle before guest cleanup.
+    #[serde(rename = "cancelRequested")]
+    pub cancel_requested: bool,
+}
+
+impl SandboxAllocation {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(
+        version: i32,
+        owner_id: String,
+        allocation_id: String,
+        sandbox_id: Nullable<String>,
+        request_digest: Nullable<String>,
+        state: String,
+        cancel_requested: bool,
+    ) -> SandboxAllocation {
+        SandboxAllocation {
+            version,
+            owner_id,
+            allocation_id,
+            sandbox_id,
+            request_digest,
+            state,
+            cancel_requested,
+        }
+    }
+}
+
+/// Converts the SandboxAllocation value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for SandboxAllocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("version".to_string()),
+            Some(self.version.to_string()),
+            Some("ownerId".to_string()),
+            Some(self.owner_id.to_string()),
+            Some("allocationId".to_string()),
+            Some(self.allocation_id.to_string()),
+            Some("sandboxId".to_string()),
+            Some(
+                self.sandbox_id
+                    .as_ref()
+                    .map_or("null".to_string(), |x| x.to_string()),
+            ),
+            Some("requestDigest".to_string()),
+            Some(
+                self.request_digest
+                    .as_ref()
+                    .map_or("null".to_string(), |x| x.to_string()),
+            ),
+            Some("state".to_string()),
+            Some(self.state.to_string()),
+            Some("cancelRequested".to_string()),
+            Some(self.cancel_requested.to_string()),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a SandboxAllocation value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for SandboxAllocation {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub version: Vec<i32>,
+            pub owner_id: Vec<String>,
+            pub allocation_id: Vec<String>,
+            pub sandbox_id: Vec<String>,
+            pub request_digest: Vec<String>,
+            pub state: Vec<String>,
+            pub cancel_requested: Vec<bool>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing SandboxAllocation".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "version" => intermediate_rep.version.push(<i32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "ownerId" => intermediate_rep.owner_id.push(<String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "allocationId" => intermediate_rep.allocation_id.push(<String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    "sandboxId" => return std::result::Result::Err("Parsing a nullable type in this style is not supported in SandboxAllocation".to_string()),
+                    "requestDigest" => return std::result::Result::Err("Parsing a nullable type in this style is not supported in SandboxAllocation".to_string()),
+                    #[allow(clippy::redundant_clone)]
+                    "state" => intermediate_rep.state.push(<String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "cancelRequested" => intermediate_rep.cancel_requested.push(<bool as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    _ => return std::result::Result::Err("Unexpected key while parsing SandboxAllocation".to_string())
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(SandboxAllocation {
+            version: intermediate_rep
+                .version
+                .into_iter()
+                .next()
+                .ok_or_else(|| "version missing in SandboxAllocation".to_string())?,
+            owner_id: intermediate_rep
+                .owner_id
+                .into_iter()
+                .next()
+                .ok_or_else(|| "ownerId missing in SandboxAllocation".to_string())?,
+            allocation_id: intermediate_rep
+                .allocation_id
+                .into_iter()
+                .next()
+                .ok_or_else(|| "allocationId missing in SandboxAllocation".to_string())?,
+            sandbox_id: std::result::Result::Err(
+                "Nullable types not supported in SandboxAllocation".to_string(),
+            )?,
+            request_digest: std::result::Result::Err(
+                "Nullable types not supported in SandboxAllocation".to_string(),
+            )?,
+            state: intermediate_rep
+                .state
+                .into_iter()
+                .next()
+                .ok_or_else(|| "state missing in SandboxAllocation".to_string())?,
+            cancel_requested: intermediate_rep
+                .cancel_requested
+                .into_iter()
+                .next()
+                .ok_or_else(|| "cancelRequested missing in SandboxAllocation".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<SandboxAllocation> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<SandboxAllocation>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<SandboxAllocation>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for SandboxAllocation - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxAllocation> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <SandboxAllocation as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into SandboxAllocation - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxAllocationOwner {
+    /// Note: inline enums are not fully supported by openapi-generator
+    #[serde(rename = "version")]
+    pub version: i32,
+
+    #[serde(rename = "ownerId")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub owner_id: String,
+}
+
+impl SandboxAllocationOwner {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(version: i32, owner_id: String) -> SandboxAllocationOwner {
+        SandboxAllocationOwner { version, owner_id }
+    }
+}
+
+/// Converts the SandboxAllocationOwner value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for SandboxAllocationOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("version".to_string()),
+            Some(self.version.to_string()),
+            Some("ownerId".to_string()),
+            Some(self.owner_id.to_string()),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a SandboxAllocationOwner value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for SandboxAllocationOwner {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub version: Vec<i32>,
+            pub owner_id: Vec<String>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing SandboxAllocationOwner".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "version" => intermediate_rep.version.push(
+                        <i32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "ownerId" => intermediate_rep.owner_id.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing SandboxAllocationOwner".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(SandboxAllocationOwner {
+            version: intermediate_rep
+                .version
+                .into_iter()
+                .next()
+                .ok_or_else(|| "version missing in SandboxAllocationOwner".to_string())?,
+            owner_id: intermediate_rep
+                .owner_id
+                .into_iter()
+                .next()
+                .ok_or_else(|| "ownerId missing in SandboxAllocationOwner".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<SandboxAllocationOwner> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<SandboxAllocationOwner>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<SandboxAllocationOwner>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for SandboxAllocationOwner - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxAllocationOwner> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <SandboxAllocationOwner as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into SandboxAllocationOwner - {err}"#
                     )),
                 }
             }

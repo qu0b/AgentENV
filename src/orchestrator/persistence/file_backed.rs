@@ -88,6 +88,7 @@ pub struct FileBackedSandboxPersister {
     virtualization_mode: VirtualizationMode,
     durability: LocalStoreDurability,
     db: OnceCell<LocalKvStore>,
+    allocations: OnceCell<std::sync::Arc<crate::allocation::AllocationJournal>>,
 }
 
 impl FileBackedSandboxPersister {
@@ -97,6 +98,7 @@ impl FileBackedSandboxPersister {
             virtualization_mode,
             durability: LocalStoreDurability::Sync,
             db: OnceCell::new(),
+            allocations: OnceCell::new(),
         }
     }
 
@@ -108,6 +110,17 @@ impl FileBackedSandboxPersister {
     pub fn with_durability(mut self, durability: LocalStoreDurability) -> Self {
         self.durability = durability;
         self
+    }
+
+    pub(crate) async fn allocation_journal(
+        &self,
+    ) -> anyhow::Result<std::sync::Arc<crate::allocation::AllocationJournal>> {
+        self.allocations
+            .get_or_try_init(|| {
+                crate::allocation::AllocationJournal::open(self.root.join("allocations.db"))
+            })
+            .await
+            .cloned()
     }
 
     fn records_db_path(&self) -> PathBuf {

@@ -597,6 +597,41 @@ components:
         volumeMounts:
           $ref: "#/components/schemas/VolumeMounts"
 
+    SandboxAllocationOwner:
+      type: object
+      required: [version, ownerId]
+      properties:
+        version:
+          type: integer
+          enum: [1]
+        ownerId:
+          type: string
+
+    SandboxAllocation:
+      type: object
+      required: [version, ownerId, allocationId, sandboxId, requestDigest, state, cancelRequested]
+      properties:
+        version:
+          type: integer
+          enum: [1]
+        ownerId:
+          type: string
+        allocationId:
+          type: string
+        sandboxId:
+          type: string
+          nullable: true
+        requestDigest:
+          type: string
+          nullable: true
+        state:
+          type: string
+          enum: [pending, settled, cancelled, interrupted]
+          description: Settled means the create handler ended, not that the guest was deleted. Interrupted requires host reconciliation; an empty in-memory inventory is insufficient.
+        cancelRequested:
+          type: boolean
+          description: Prevents a later request from claiming this key. An already pending operation is allowed to settle before guest cleanup.
+
     NewSandbox:
       required:
         - templateID
@@ -1487,6 +1522,121 @@ paths:
           description: Volume deleted successfully
         "404":
           $ref: "#/components/responses/404"
+        "409":
+          $ref: "#/components/responses/409"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /sandbox-allocation-owner:
+    get:
+      summary: Read the durable allocation state owner
+      description: Persist this owner ID in the client intent before sending a keyed create. Supply it on all allocation requests; a different node or recreated database must not settle the original work.
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: Allocation owner
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SandboxAllocationOwner"
+        "401":
+          $ref: "#/components/responses/401"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /sandbox-allocations/{allocationID}:
+    parameters:
+      - name: X-Agentenv-Allocation-Owner
+        in: header
+        required: true
+        description: Durable owner ID read before the original create intent. A mismatch returns 409 without claiming or cancelling the key.
+        schema:
+          type: string
+      - name: allocationID
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Create a sandbox with durable allocation ownership
+      description: >
+        Commit a server-assigned sandbox ID before template resolution, volume
+        restoration or VM launch. The allocationID is a non-nil UUID and is
+        never reusable. Repeated requests return 409 without new work; changed
+        request bodies are rejected. Query the receipt after a lost response.
+        This dedicated route fails on servers without allocation support.
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NewSandbox"
+      responses:
+        "201":
+          description: The sandbox was created successfully
+          headers:
+            x-agentenv-sandbox-id:
+              description: Identifier of the created sandbox for proxy routing.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Sandbox"
+        "401":
+          $ref: "#/components/responses/401"
+        "400":
+          $ref: "#/components/responses/400"
+        "409":
+          $ref: "#/components/responses/409"
+        "500":
+          $ref: "#/components/responses/500"
+
+    get:
+      summary: Read the original keyed create outcome
+      description: Read-only lookup. A 404 is absence of a receipt, not proof that a delayed POST cannot still arrive. Keys and receipts are node-local and must be routed to the original durable state owner.
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: Allocation receipt
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SandboxAllocation"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "409":
+          $ref: "#/components/responses/409"
+        "500":
+          $ref: "#/components/responses/500"
+    delete:
+      summary: Fence a keyed create operation
+      description: Durably prevents a not-yet-arrived request from creating a guest. Does not delete a guest. If a create is pending, wait for settlement and then clean up the original sandbox. Interrupted receipts require host reconciliation. Retain cancellation tombstones across restarts.
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: Allocation receipt
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SandboxAllocation"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
         "409":
           $ref: "#/components/responses/409"
         "500":

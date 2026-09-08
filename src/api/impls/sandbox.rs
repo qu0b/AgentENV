@@ -34,6 +34,13 @@ use super::pagination::PaginationCursor;
 use super::volumes::{error_response as volume_error_response, resolve_volume_mounts};
 use super::ApiImpl;
 
+fn allocation_id(value: &str) -> Result<Uuid, models::Error> {
+    Uuid::parse_str(value)
+        .ok()
+        .filter(|id| !id.is_nil())
+        .ok_or_else(|| ApiImpl::error(400, "allocation key must be a non-nil UUID"))
+}
+
 fn sandbox_not_found(id: impl Into<String>) -> models::Error {
     ApiImpl::error(404, format!("sandbox {} not found", id.into()))
 }
@@ -426,6 +433,224 @@ impl From<SandboxMetadata> for models::SandboxDetail {
 }
 
 impl ApiImpl {
+    async fn owned_allocation_journal(
+        &self,
+        owner: &str,
+    ) -> Result<std::sync::Arc<crate::allocation::AllocationJournal>, models::Error> {
+        let owner = Uuid::parse_str(owner)
+            .map_err(|_| Self::error(400, "allocation owner must be a UUID"))?;
+        let journal = self
+            .orchestrator
+            .allocation_journal()
+            .await
+            .map_err(|error| {
+                warn!(%error, "allocation journal unavailable");
+                Self::error(500, "allocation journal unavailable")
+            })?;
+        if journal.owner_id() != owner {
+            return Err(Self::error(
+                409,
+                "allocation belongs to a different durable state owner",
+            ));
+        }
+        Ok(journal)
+    }
+
+    async fn create_keyed_sandbox(
+        &self,
+        id: Uuid,
+        body: &models::NewSandbox,
+        journal: std::sync::Arc<crate::allocation::AllocationJournal>,
+    ) -> Result<SandboxesPostResponse, ()> {
+        use crate::allocation::{request_digest, AllocationConflict, AllocationResult};
+        let this = self.clone();
+        let body = body.clone();
+        let result = async {
+            journal
+                .execute(id, request_digest(&body)?, move |sandbox_id| async move {
+                    this.create_warm_sandbox(&body, sandbox_id).await
+                })
+                .await
+        }
+        .await;
+        match result {
+            Ok(AllocationResult::Completed(response)) => response,
+            Ok(AllocationResult::Existing(receipt)) => {
+                Ok(SandboxesPostResponse::Status409_Conflict(Self::error(
+                    409,
+                    format!("allocation {} already claimed ({:?}); query its sandbox-allocation receipt", receipt.allocation_id, receipt.state),
+                )))
+            }
+            Err(error) if error.is::<AllocationConflict>() => Ok(
+                SandboxesPostResponse::Status409_Conflict(Self::error(409, error.to_string())),
+            ),
+            Err(error) => {
+                warn!(%error, %id, "keyed sandbox allocation failed");
+                Ok(SandboxesPostResponse::Status500_ServerError(Self::error(
+                    500,
+                    "allocation outcome unavailable; query the original allocation key",
+                )))
+            }
+        }
+    }
+
+    async fn create_warm_sandbox(
+        &self,
+        body: &models::NewSandbox,
+        sandbox_id: SandboxId,
+    ) -> Result<SandboxesPostResponse, ()> {
+        let timer = SandboxStageTimer::new("create_warm");
+        let snapshot = match timer
+            .time(
+                "load_snapshot",
+                self.snapshot_manager.load_runnable(&body.template_id),
+            )
+            .await
+        {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
+                    400,
+                    format!("template {} not found", body.template_id),
+                )));
+            }
+            Err(err) => {
+                warn!(error = ?err, template_id = %body.template_id, "failed to load runnable snapshot");
+                return Ok(SandboxesPostResponse::Status500_ServerError(
+                    Self::snapshot_manager_error(&err),
+                ));
+            }
+        };
+
+        let network_policy =
+            match network_policy_from_create(body.allow_internet_access, body.network.as_ref()) {
+                Ok(network) => network,
+                Err(err) => {
+                    return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
+                        400,
+                        err.to_string(),
+                    )));
+                }
+            };
+
+        let custom_params = body
+            .custom_extension_params
+            .as_ref()
+            .map(params_model_to_map);
+        if let Err(err) = validate_custom_extension_params(custom_params.as_ref()) {
+            return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
+                400,
+                err.to_string(),
+            )));
+        }
+
+        let extra_drives_in_snapshot =
+            body.volume_mounts.is_none() && !snapshot.committed().volume_snapshots.is_empty();
+        let (requested_volume_mounts, restored_volume_ids) = if body.volume_mounts.is_some() {
+            (body.volume_mounts.clone(), Vec::new())
+        } else {
+            match restore_snapshot_volume_mounts(self, &snapshot).await {
+                Ok((mounts, volume_ids)) => ((!mounts.is_empty()).then_some(mounts), volume_ids),
+                Err(error) => {
+                    return Ok(match error.code {
+                        500 => SandboxesPostResponse::Status500_ServerError(error),
+                        _ => SandboxesPostResponse::Status400_BadRequest(error),
+                    });
+                }
+            }
+        };
+        let PreparedVolumeMounts {
+            owner: pending_volume_owner,
+            drives: volume_drives,
+            mounts: volume_mounts,
+            volume_ids: reserved_volume_ids,
+        } = match prepare_volume_mounts(self, requested_volume_mounts.as_ref()).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
+                return Ok(match error.code {
+                    500.. => SandboxesPostResponse::Status500_ServerError(error),
+                    409 => SandboxesPostResponse::Status409_Conflict(error),
+                    _ => SandboxesPostResponse::Status400_BadRequest(error),
+                });
+            }
+        };
+
+        let request = CreateSandboxRequest {
+            source: SandboxLaunchSource::Snapshot(Box::new(snapshot)),
+            extra_drives: volume_drives,
+            extra_drives_in_snapshot,
+            timeout: duration_from_secs(body.timeout),
+            timeout_action: match body.auto_pause {
+                Some(false) => SandboxTimeoutAction::Delete,
+                _ => SandboxTimeoutAction::Pause,
+            },
+            auto_resume: body.auto_resume.as_ref().is_some_and(|cfg| cfg.enabled),
+            user_metadata: body.metadata.clone(),
+            env_vars: body
+                .env_vars
+                .clone()
+                .filter(|env_vars| !env_vars.is_empty()),
+            network_policy,
+            secure: body.secure == Some(true),
+            custom_extension_params: custom_params,
+            volume_mounts,
+        };
+
+        match timer
+            .time(
+                "create_sandbox",
+                self.orchestrator
+                    .create_sandbox_with_id(sandbox_id, request),
+            )
+            .await
+        {
+            Ok(metadata) => {
+                if let Err(error) = finish_volume_reservation(
+                    &self.volume_manager,
+                    pending_volume_owner.as_deref(),
+                    Some(metadata.id),
+                    &reserved_volume_ids,
+                )
+                .await
+                {
+                    let _ = self.orchestrator.delete_sandbox(metadata.id).await;
+                    if let Some(owner) = pending_volume_owner.as_deref() {
+                        let _ = self
+                            .volume_manager
+                            .replace_owner_for(owner, None, &reserved_volume_ids)
+                            .await;
+                    }
+                    cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
+                    return Ok(SandboxesPostResponse::Status500_ServerError(Self::error(
+                        500,
+                        format!("failed to finalize volume reservation: {error}"),
+                    )));
+                }
+                let sandbox_id = metadata.id.to_string();
+                Ok(
+                    SandboxesPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
+                        body: self.sandbox_model(metadata),
+                        x_agentenv_sandbox_id: Some(sandbox_id),
+                    },
+                )
+            }
+            Err(err) => {
+                let _ = finish_volume_reservation(
+                    &self.volume_manager,
+                    pending_volume_owner.as_deref(),
+                    None,
+                    &reserved_volume_ids,
+                )
+                .await;
+                cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
+                Ok(SandboxesPostResponse::Status500_ServerError(
+                    Self::internal_error(&err),
+                ))
+            }
+        }
+    }
+
     fn sandbox_model(&self, metadata: SandboxMetadata) -> models::Sandbox {
         let traffic_access_token = (!metadata.network_policy.allow_public_traffic)
             .then(|| self.traffic_access_token(metadata.id));
@@ -639,6 +864,166 @@ fn validate_domain_allowlist(policy: &SandboxNetworkPolicy) -> anyhow::Result<()
 
 #[async_trait]
 impl Sandboxes<()> for ApiImpl {
+    async fn sandbox_allocation_owner_get(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+    ) -> Result<SandboxAllocationOwnerGetResponse, ()> {
+        use SandboxAllocationOwnerGetResponse as Response;
+        Ok(match self.orchestrator.allocation_journal().await {
+            Ok(journal) => Response::Status200_AllocationOwner(
+                models::SandboxAllocationOwner::new(1, journal.owner_id().to_string()),
+            ),
+            Err(error) => {
+                warn!(%error, "allocation owner unavailable");
+                Response::Status500_ServerError(Self::error(500, "allocation owner unavailable"))
+            }
+        })
+    }
+
+    async fn sandbox_allocations_allocation_id_post(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        header_params: &models::SandboxAllocationsAllocationIdPostHeaderParams,
+        path_params: &models::SandboxAllocationsAllocationIdPostPathParams,
+        body: &models::NewSandbox,
+    ) -> Result<SandboxAllocationsAllocationIdPostResponse, ()> {
+        use SandboxAllocationsAllocationIdPostResponse as Response;
+        let journal = match self
+            .owned_allocation_journal(&header_params.x_agentenv_allocation_owner)
+            .await
+        {
+            Ok(journal) => journal,
+            Err(error) => {
+                return Ok(match error.code {
+                    400 => Response::Status400_BadRequest(error),
+                    409 => Response::Status409_Conflict(error),
+                    _ => Response::Status500_ServerError(error),
+                })
+            }
+        };
+        let id = match allocation_id(&path_params.allocation_id) {
+            Ok(id) => id,
+            Err(error) => return Ok(Response::Status400_BadRequest(error)),
+        };
+        Ok(match self.create_keyed_sandbox(id, body, journal).await? {
+            SandboxesPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
+                body,
+                x_agentenv_sandbox_id,
+            } => Response::Status201_TheSandboxWasCreatedSuccessfully {
+                body,
+                x_agentenv_sandbox_id,
+            },
+            SandboxesPostResponse::Status400_BadRequest(error) => {
+                Response::Status400_BadRequest(error)
+            }
+            SandboxesPostResponse::Status401_AuthenticationError(error) => {
+                Response::Status401_AuthenticationError(error)
+            }
+            SandboxesPostResponse::Status409_Conflict(error) => Response::Status409_Conflict(error),
+            SandboxesPostResponse::Status500_ServerError(error) => {
+                Response::Status500_ServerError(error)
+            }
+        })
+    }
+
+    async fn sandbox_allocations_allocation_id_get(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        header_params: &models::SandboxAllocationsAllocationIdGetHeaderParams,
+        path_params: &models::SandboxAllocationsAllocationIdGetPathParams,
+    ) -> Result<SandboxAllocationsAllocationIdGetResponse, ()> {
+        use SandboxAllocationsAllocationIdGetResponse as Response;
+        let journal = match self
+            .owned_allocation_journal(&header_params.x_agentenv_allocation_owner)
+            .await
+        {
+            Ok(journal) => journal,
+            Err(error) => {
+                return Ok(match error.code {
+                    400 => Response::Status400_BadRequest(error),
+                    409 => Response::Status409_Conflict(error),
+                    _ => Response::Status500_ServerError(error),
+                })
+            }
+        };
+        let id = match allocation_id(&path_params.allocation_id) {
+            Ok(id) => id,
+            Err(error) => return Ok(Response::Status400_BadRequest(error)),
+        };
+        let result: anyhow::Result<Option<models::SandboxAllocation>> = async {
+            journal
+                .get(id)
+                .await?
+                .map(|receipt| Ok(serde_json::from_value(serde_json::to_value(receipt)?)?))
+                .transpose()
+        }
+        .await;
+        Ok(match result {
+            Ok(Some(receipt)) => Response::Status200_AllocationReceipt(receipt),
+            Ok(None) => {
+                Response::Status404_NotFound(Self::error(404, "allocation receipt not found"))
+            }
+            Err(error) => {
+                warn!(%error, %id, "failed to read allocation receipt");
+                Response::Status500_ServerError(Self::error(500, "allocation receipt unavailable"))
+            }
+        })
+    }
+
+    async fn sandbox_allocations_allocation_id_delete(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        header_params: &models::SandboxAllocationsAllocationIdDeleteHeaderParams,
+        path_params: &models::SandboxAllocationsAllocationIdDeletePathParams,
+    ) -> Result<SandboxAllocationsAllocationIdDeleteResponse, ()> {
+        use SandboxAllocationsAllocationIdDeleteResponse as Response;
+        let journal = match self
+            .owned_allocation_journal(&header_params.x_agentenv_allocation_owner)
+            .await
+        {
+            Ok(journal) => journal,
+            Err(error) => {
+                return Ok(match error.code {
+                    400 => Response::Status400_BadRequest(error),
+                    409 => Response::Status409_Conflict(error),
+                    _ => Response::Status500_ServerError(error),
+                })
+            }
+        };
+        let id = match allocation_id(&path_params.allocation_id) {
+            Ok(id) => id,
+            Err(error) => return Ok(Response::Status400_BadRequest(error)),
+        };
+        let result: anyhow::Result<models::SandboxAllocation> = async {
+            Ok(serde_json::from_value(serde_json::to_value(
+                journal.cancel(id).await?,
+            )?)?)
+        }
+        .await;
+        Ok(match result {
+            Ok(receipt) => Response::Status200_AllocationReceipt(receipt),
+            Err(error) => {
+                warn!(%error, %id, "failed to fence allocation");
+                Response::Status500_ServerError(Self::error(
+                    500,
+                    "allocation cancellation unavailable",
+                ))
+            }
+        })
+    }
+
     type Claims = super::Claims;
 
     async fn sandboxes_cold_post(
@@ -875,152 +1260,7 @@ impl Sandboxes<()> for ApiImpl {
         _claims: &Self::Claims,
         body: &models::NewSandbox,
     ) -> Result<SandboxesPostResponse, ()> {
-        let timer = SandboxStageTimer::new("create_warm");
-        let snapshot = match timer
-            .time(
-                "load_snapshot",
-                self.snapshot_manager.load_runnable(&body.template_id),
-            )
-            .await
-        {
-            Ok(Some(snapshot)) => snapshot,
-            Ok(None) => {
-                return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
-                    400,
-                    format!("template {} not found", body.template_id),
-                )));
-            }
-            Err(err) => {
-                warn!(error = ?err, template_id = %body.template_id, "failed to load runnable snapshot");
-                return Ok(SandboxesPostResponse::Status500_ServerError(
-                    Self::snapshot_manager_error(&err),
-                ));
-            }
-        };
-
-        let network_policy =
-            match network_policy_from_create(body.allow_internet_access, body.network.as_ref()) {
-                Ok(network) => network,
-                Err(err) => {
-                    return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
-                        400,
-                        err.to_string(),
-                    )));
-                }
-            };
-
-        let custom_params = body
-            .custom_extension_params
-            .as_ref()
-            .map(params_model_to_map);
-        if let Err(err) = validate_custom_extension_params(custom_params.as_ref()) {
-            return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
-                400,
-                err.to_string(),
-            )));
-        }
-
-        let extra_drives_in_snapshot =
-            body.volume_mounts.is_none() && !snapshot.committed().volume_snapshots.is_empty();
-        let (requested_volume_mounts, restored_volume_ids) = if body.volume_mounts.is_some() {
-            (body.volume_mounts.clone(), Vec::new())
-        } else {
-            match restore_snapshot_volume_mounts(self, &snapshot).await {
-                Ok((mounts, volume_ids)) => ((!mounts.is_empty()).then_some(mounts), volume_ids),
-                Err(error) => {
-                    return Ok(match error.code {
-                        500 => SandboxesPostResponse::Status500_ServerError(error),
-                        _ => SandboxesPostResponse::Status400_BadRequest(error),
-                    });
-                }
-            }
-        };
-        let PreparedVolumeMounts {
-            owner: pending_volume_owner,
-            drives: volume_drives,
-            mounts: volume_mounts,
-            volume_ids: reserved_volume_ids,
-        } = match prepare_volume_mounts(self, requested_volume_mounts.as_ref()).await {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
-                return Ok(match error.code {
-                    500.. => SandboxesPostResponse::Status500_ServerError(error),
-                    409 => SandboxesPostResponse::Status409_Conflict(error),
-                    _ => SandboxesPostResponse::Status400_BadRequest(error),
-                });
-            }
-        };
-
-        let request = CreateSandboxRequest {
-            source: SandboxLaunchSource::Snapshot(Box::new(snapshot)),
-            extra_drives: volume_drives,
-            extra_drives_in_snapshot,
-            timeout: duration_from_secs(body.timeout),
-            timeout_action: match body.auto_pause {
-                Some(false) => SandboxTimeoutAction::Delete,
-                _ => SandboxTimeoutAction::Pause,
-            },
-            auto_resume: body.auto_resume.as_ref().is_some_and(|cfg| cfg.enabled),
-            user_metadata: body.metadata.clone(),
-            env_vars: body
-                .env_vars
-                .clone()
-                .filter(|env_vars| !env_vars.is_empty()),
-            network_policy,
-            secure: body.secure == Some(true),
-            custom_extension_params: custom_params,
-            volume_mounts,
-        };
-
-        match timer
-            .time("create_sandbox", self.orchestrator.create_sandbox(request))
-            .await
-        {
-            Ok(metadata) => {
-                if let Err(error) = finish_volume_reservation(
-                    &self.volume_manager,
-                    pending_volume_owner.as_deref(),
-                    Some(metadata.id),
-                    &reserved_volume_ids,
-                )
-                .await
-                {
-                    let _ = self.orchestrator.delete_sandbox(metadata.id).await;
-                    if let Some(owner) = pending_volume_owner.as_deref() {
-                        let _ = self
-                            .volume_manager
-                            .replace_owner_for(owner, None, &reserved_volume_ids)
-                            .await;
-                    }
-                    cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
-                    return Ok(SandboxesPostResponse::Status500_ServerError(Self::error(
-                        500,
-                        format!("failed to finalize volume reservation: {error}"),
-                    )));
-                }
-                let sandbox_id = metadata.id.to_string();
-                Ok(
-                    SandboxesPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
-                        body: self.sandbox_model(metadata),
-                        x_agentenv_sandbox_id: Some(sandbox_id),
-                    },
-                )
-            }
-            Err(err) => {
-                let _ = finish_volume_reservation(
-                    &self.volume_manager,
-                    pending_volume_owner.as_deref(),
-                    None,
-                    &reserved_volume_ids,
-                )
-                .await;
-                cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
-                Ok(SandboxesPostResponse::Status500_ServerError(
-                    Self::internal_error(&err),
-                ))
-            }
-        }
+        self.create_warm_sandbox(body, SandboxId::new()).await
     }
 
     async fn sandboxes_sandbox_id_connect_post(

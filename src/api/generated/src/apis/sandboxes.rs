@@ -11,6 +11,71 @@ use crate::{models, types::*};
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[must_use]
 #[allow(clippy::large_enum_variant)]
+pub enum SandboxAllocationOwnerGetResponse {
+    /// Allocation owner
+    Status200_AllocationOwner(models::SandboxAllocationOwner),
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
+    /// Server error
+    Status500_ServerError(models::Error),
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[must_use]
+#[allow(clippy::large_enum_variant)]
+pub enum SandboxAllocationsAllocationIdDeleteResponse {
+    /// Allocation receipt
+    Status200_AllocationReceipt(models::SandboxAllocation),
+    /// Bad request
+    Status400_BadRequest(models::Error),
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
+    /// Conflict
+    Status409_Conflict(models::Error),
+    /// Server error
+    Status500_ServerError(models::Error),
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[must_use]
+#[allow(clippy::large_enum_variant)]
+pub enum SandboxAllocationsAllocationIdGetResponse {
+    /// Allocation receipt
+    Status200_AllocationReceipt(models::SandboxAllocation),
+    /// Bad request
+    Status400_BadRequest(models::Error),
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
+    /// Not found
+    Status404_NotFound(models::Error),
+    /// Conflict
+    Status409_Conflict(models::Error),
+    /// Server error
+    Status500_ServerError(models::Error),
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[must_use]
+#[allow(clippy::large_enum_variant)]
+pub enum SandboxAllocationsAllocationIdPostResponse {
+    /// The sandbox was created successfully
+    Status201_TheSandboxWasCreatedSuccessfully {
+        body: models::Sandbox,
+        x_agentenv_sandbox_id: Option<String>,
+    },
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
+    /// Bad request
+    Status400_BadRequest(models::Error),
+    /// Conflict
+    Status409_Conflict(models::Error),
+    /// Server error
+    Status500_ServerError(models::Error),
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[must_use]
+#[allow(clippy::large_enum_variant)]
 pub enum SandboxesColdPostResponse {
     /// The sandbox was created successfully
     Status201_TheSandboxWasCreatedSuccessfully {
@@ -283,6 +348,61 @@ pub trait Sandboxes<E: std::fmt::Debug + Send + Sync + 'static = ()>:
     super::ErrorHandler<E>
 {
     type Claims;
+
+    /// Read the durable allocation state owner.
+    ///
+    /// SandboxAllocationOwnerGet - GET /sandbox-allocation-owner
+    async fn sandbox_allocation_owner_get(
+        &self,
+
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+    ) -> Result<SandboxAllocationOwnerGetResponse, E>;
+
+    /// Fence a keyed create operation.
+    ///
+    /// SandboxAllocationsAllocationIdDelete - DELETE /sandbox-allocations/{allocationID}
+    async fn sandbox_allocations_allocation_id_delete(
+        &self,
+
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        header_params: &models::SandboxAllocationsAllocationIdDeleteHeaderParams,
+        path_params: &models::SandboxAllocationsAllocationIdDeletePathParams,
+    ) -> Result<SandboxAllocationsAllocationIdDeleteResponse, E>;
+
+    /// Read the original keyed create outcome.
+    ///
+    /// SandboxAllocationsAllocationIdGet - GET /sandbox-allocations/{allocationID}
+    async fn sandbox_allocations_allocation_id_get(
+        &self,
+
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        header_params: &models::SandboxAllocationsAllocationIdGetHeaderParams,
+        path_params: &models::SandboxAllocationsAllocationIdGetPathParams,
+    ) -> Result<SandboxAllocationsAllocationIdGetResponse, E>;
+
+    /// Create a sandbox with durable allocation ownership.
+    ///
+    /// SandboxAllocationsAllocationIdPost - POST /sandbox-allocations/{allocationID}
+    async fn sandbox_allocations_allocation_id_post(
+        &self,
+
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        header_params: &models::SandboxAllocationsAllocationIdPostHeaderParams,
+        path_params: &models::SandboxAllocationsAllocationIdPostPathParams,
+        body: &models::NewSandbox,
+    ) -> Result<SandboxAllocationsAllocationIdPostResponse, E>;
 
     /// SandboxesColdPost - POST /sandboxes-cold
     async fn sandboxes_cold_post(

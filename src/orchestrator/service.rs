@@ -127,6 +127,12 @@ impl<F> Orchestrator<InMemoryMetadataStore, F>
 where
     F: SandboxBackendFactory,
 {
+    pub(crate) async fn allocation_journal(
+        &self,
+    ) -> anyhow::Result<Arc<crate::allocation::AllocationJournal>> {
+        self.persister.allocation_journal().await
+    }
+
     pub async fn with_file_backed_store_and_factory(factory: F) -> Result<Arc<Self>> {
         let config = ConfigManager::global_config();
         let store = InMemoryMetadataStore::new();
@@ -397,7 +403,14 @@ where
         self: &Arc<Self>,
         request: CreateSandboxRequest,
     ) -> Result<SandboxMetadata> {
-        let sandbox_id = SandboxId::new();
+        self.create_sandbox_with_id(SandboxId::new(), request).await
+    }
+
+    pub(crate) async fn create_sandbox_with_id(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        request: CreateSandboxRequest,
+    ) -> Result<SandboxMetadata> {
         let this = Arc::clone(self);
         self.run_cancellation_safe("create", sandbox_id, async move {
             this.create_sandbox_inner(sandbox_id, request).await

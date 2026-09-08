@@ -1,4 +1,6 @@
 mod admin;
+#[cfg(test)]
+mod allocation_tests;
 mod attached_drives;
 pub(crate) mod auth;
 mod pagination;

@@ -47,6 +47,16 @@ where
         .route("/nodes", get(nodes_get::<I, A, E, C>))
         .route("/nodes/{node_id}", get(nodes_node_id_get::<I, A, E, C>))
         .route(
+            "/sandbox-allocation-owner",
+            get(sandbox_allocation_owner_get::<I, A, E, C>),
+        )
+        .route(
+            "/sandbox-allocations/{allocation_id}",
+            delete(sandbox_allocations_allocation_id_delete::<I, A, E, C>)
+                .get(sandbox_allocations_allocation_id_get::<I, A, E, C>)
+                .post(sandbox_allocations_allocation_id_post::<I, A, E, C>),
+        )
+        .route(
             "/sandboxes",
             get(sandboxes_get::<I, A, E, C>).post(sandboxes_post::<I, A, E, C>),
         )
@@ -483,6 +493,820 @@ where
                 .await;
         }
     };
+
+    resp.map_err(|e| {
+        error!(error = ?e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+#[tracing::instrument(skip_all)]
+fn sandbox_allocation_owner_get_validation() -> std::result::Result<(), ValidationErrors> {
+    Ok(())
+}
+/// SandboxAllocationOwnerGet - GET /sandbox-allocation-owner
+#[tracing::instrument(skip_all)]
+async fn sandbox_allocation_owner_get<I, A, E, C>(
+    method: Method,
+    TypedHeader(host): TypedHeader<Host>,
+    cookies: CookieJar,
+    headers: HeaderMap,
+    State(api_impl): State<I>,
+) -> Result<Response, StatusCode>
+where
+    I: AsRef<A> + Send + Sync,
+    A: apis::sandboxes::Sandboxes<E, Claims = C> + apis::ApiKeyAuthHeader<Claims = C> + Send + Sync,
+    E: std::fmt::Debug + Send + Sync + 'static,
+{
+    // Authentication
+    let claims_in_header = api_impl
+        .as_ref()
+        .extract_claims_from_header(&headers, "X-API-Key")
+        .await;
+    let claims = None.or(claims_in_header);
+    let Some(claims) = claims else {
+        return response_with_status_code_only(StatusCode::UNAUTHORIZED);
+    };
+
+    #[allow(clippy::redundant_closure)]
+    let validation = tokio::task::spawn_blocking(move || sandbox_allocation_owner_get_validation())
+        .await
+        .unwrap();
+
+    let Ok(()) = validation else {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from(validation.unwrap_err().to_string()))
+            .map_err(|_| StatusCode::BAD_REQUEST);
+    };
+
+    let result = api_impl
+        .as_ref()
+        .sandbox_allocation_owner_get(&method, &host, &cookies, &claims)
+        .await;
+
+    let mut response = Response::builder();
+
+    let resp = match result {
+        Ok(rsp) => match rsp {
+            apis::sandboxes::SandboxAllocationOwnerGetResponse::Status200_AllocationOwner(body) => {
+                let mut response = response.status(200);
+                {
+                    let mut response_headers = response.headers_mut().unwrap();
+                    response_headers
+                        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                }
+
+                let body_content = tokio::task::spawn_blocking(move || {
+                    serde_json::to_vec(&body).map_err(|e| {
+                        error!(error = ?e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })
+                })
+                .await
+                .unwrap()?;
+                response.body(Body::from(body_content))
+            }
+            apis::sandboxes::SandboxAllocationOwnerGetResponse::Status401_AuthenticationError(
+                body,
+            ) => {
+                let mut response = response.status(401);
+                {
+                    let mut response_headers = response.headers_mut().unwrap();
+                    response_headers
+                        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                }
+
+                let body_content = tokio::task::spawn_blocking(move || {
+                    serde_json::to_vec(&body).map_err(|e| {
+                        error!(error = ?e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })
+                })
+                .await
+                .unwrap()?;
+                response.body(Body::from(body_content))
+            }
+            apis::sandboxes::SandboxAllocationOwnerGetResponse::Status500_ServerError(body) => {
+                let mut response = response.status(500);
+                {
+                    let mut response_headers = response.headers_mut().unwrap();
+                    response_headers
+                        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                }
+
+                let body_content = tokio::task::spawn_blocking(move || {
+                    serde_json::to_vec(&body).map_err(|e| {
+                        error!(error = ?e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })
+                })
+                .await
+                .unwrap()?;
+                response.body(Body::from(body_content))
+            }
+        },
+        Err(why) => {
+            // Application code returned an error. This should not happen, as the implementation should
+            // return a valid response.
+            return api_impl
+                .as_ref()
+                .handle_error(&method, &host, &cookies, why)
+                .await;
+        }
+    };
+
+    resp.map_err(|e| {
+        error!(error = ?e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+#[tracing::instrument(skip_all)]
+fn sandbox_allocations_allocation_id_delete_validation(
+    header_params: models::SandboxAllocationsAllocationIdDeleteHeaderParams,
+    path_params: models::SandboxAllocationsAllocationIdDeletePathParams,
+) -> std::result::Result<
+    (
+        models::SandboxAllocationsAllocationIdDeleteHeaderParams,
+        models::SandboxAllocationsAllocationIdDeletePathParams,
+    ),
+    ValidationErrors,
+> {
+    header_params.validate()?;
+    path_params.validate()?;
+
+    Ok((header_params, path_params))
+}
+/// SandboxAllocationsAllocationIdDelete - DELETE /sandbox-allocations/{allocationID}
+#[tracing::instrument(skip_all)]
+async fn sandbox_allocations_allocation_id_delete<I, A, E, C>(
+    method: Method,
+    TypedHeader(host): TypedHeader<Host>,
+    cookies: CookieJar,
+    headers: HeaderMap,
+    Path(path_params): Path<models::SandboxAllocationsAllocationIdDeletePathParams>,
+    State(api_impl): State<I>,
+) -> Result<Response, StatusCode>
+where
+    I: AsRef<A> + Send + Sync,
+    A: apis::sandboxes::Sandboxes<E, Claims = C> + apis::ApiKeyAuthHeader<Claims = C> + Send + Sync,
+    E: std::fmt::Debug + Send + Sync + 'static,
+{
+    // Authentication
+    let claims_in_header = api_impl
+        .as_ref()
+        .extract_claims_from_header(&headers, "X-API-Key")
+        .await;
+    let claims = None.or(claims_in_header);
+    let Some(claims) = claims else {
+        return response_with_status_code_only(StatusCode::UNAUTHORIZED);
+    };
+
+    // Header parameters
+    let header_params = {
+        let header_x_agentenv_allocation_owner =
+            headers.get(HeaderName::from_static("x-agentenv-allocation-owner"));
+
+        let header_x_agentenv_allocation_owner = match header_x_agentenv_allocation_owner {
+            Some(v) => match header::IntoHeaderValue::<String>::try_from((*v).clone()) {
+                Ok(result) => result.0,
+                Err(err) => {
+                    return Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Body::from(format!(
+                            "Invalid header X-Agentenv-Allocation-Owner - {err}"
+                        )))
+                        .map_err(|e| {
+                            error!(error = ?e);
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        });
+                }
+            },
+            None => {
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Body::from(
+                        "Missing required header X-Agentenv-Allocation-Owner",
+                    ))
+                    .map_err(|e| {
+                        error!(error = ?e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    });
+            }
+        };
+
+        models::SandboxAllocationsAllocationIdDeleteHeaderParams {
+            x_agentenv_allocation_owner: header_x_agentenv_allocation_owner,
+        }
+    };
+
+    #[allow(clippy::redundant_closure)]
+    let validation = tokio::task::spawn_blocking(move || {
+        sandbox_allocations_allocation_id_delete_validation(header_params, path_params)
+    })
+    .await
+    .unwrap();
+
+    let Ok((header_params, path_params)) = validation else {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from(validation.unwrap_err().to_string()))
+            .map_err(|_| StatusCode::BAD_REQUEST);
+    };
+
+    let result = api_impl
+        .as_ref()
+        .sandbox_allocations_allocation_id_delete(
+            &method,
+            &host,
+            &cookies,
+            &claims,
+            &header_params,
+            &path_params,
+        )
+        .await;
+
+    let mut response = Response::builder();
+
+    let resp = match result {
+                                            Ok(rsp) => match rsp {
+                                                apis::sandboxes::SandboxAllocationsAllocationIdDeleteResponse::Status200_AllocationReceipt
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(200);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::sandboxes::SandboxAllocationsAllocationIdDeleteResponse::Status400_BadRequest
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(400);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::sandboxes::SandboxAllocationsAllocationIdDeleteResponse::Status401_AuthenticationError
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(401);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::sandboxes::SandboxAllocationsAllocationIdDeleteResponse::Status409_Conflict
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(409);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::sandboxes::SandboxAllocationsAllocationIdDeleteResponse::Status500_ServerError
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(500);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                            },
+                                            Err(why) => {
+                                                    // Application code returned an error. This should not happen, as the implementation should
+                                                    // return a valid response.
+                                                    return api_impl.as_ref().handle_error(&method, &host, &cookies, why).await;
+                                            },
+                                        };
+
+    resp.map_err(|e| {
+        error!(error = ?e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+#[tracing::instrument(skip_all)]
+fn sandbox_allocations_allocation_id_get_validation(
+    header_params: models::SandboxAllocationsAllocationIdGetHeaderParams,
+    path_params: models::SandboxAllocationsAllocationIdGetPathParams,
+) -> std::result::Result<
+    (
+        models::SandboxAllocationsAllocationIdGetHeaderParams,
+        models::SandboxAllocationsAllocationIdGetPathParams,
+    ),
+    ValidationErrors,
+> {
+    header_params.validate()?;
+    path_params.validate()?;
+
+    Ok((header_params, path_params))
+}
+/// SandboxAllocationsAllocationIdGet - GET /sandbox-allocations/{allocationID}
+#[tracing::instrument(skip_all)]
+async fn sandbox_allocations_allocation_id_get<I, A, E, C>(
+    method: Method,
+    TypedHeader(host): TypedHeader<Host>,
+    cookies: CookieJar,
+    headers: HeaderMap,
+    Path(path_params): Path<models::SandboxAllocationsAllocationIdGetPathParams>,
+    State(api_impl): State<I>,
+) -> Result<Response, StatusCode>
+where
+    I: AsRef<A> + Send + Sync,
+    A: apis::sandboxes::Sandboxes<E, Claims = C> + apis::ApiKeyAuthHeader<Claims = C> + Send + Sync,
+    E: std::fmt::Debug + Send + Sync + 'static,
+{
+    // Authentication
+    let claims_in_header = api_impl
+        .as_ref()
+        .extract_claims_from_header(&headers, "X-API-Key")
+        .await;
+    let claims = None.or(claims_in_header);
+    let Some(claims) = claims else {
+        return response_with_status_code_only(StatusCode::UNAUTHORIZED);
+    };
+
+    // Header parameters
+    let header_params = {
+        let header_x_agentenv_allocation_owner =
+            headers.get(HeaderName::from_static("x-agentenv-allocation-owner"));
+
+        let header_x_agentenv_allocation_owner = match header_x_agentenv_allocation_owner {
+            Some(v) => match header::IntoHeaderValue::<String>::try_from((*v).clone()) {
+                Ok(result) => result.0,
+                Err(err) => {
+                    return Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Body::from(format!(
+                            "Invalid header X-Agentenv-Allocation-Owner - {err}"
+                        )))
+                        .map_err(|e| {
+                            error!(error = ?e);
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        });
+                }
+            },
+            None => {
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Body::from(
+                        "Missing required header X-Agentenv-Allocation-Owner",
+                    ))
+                    .map_err(|e| {
+                        error!(error = ?e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    });
+            }
+        };
+
+        models::SandboxAllocationsAllocationIdGetHeaderParams {
+            x_agentenv_allocation_owner: header_x_agentenv_allocation_owner,
+        }
+    };
+
+    #[allow(clippy::redundant_closure)]
+    let validation = tokio::task::spawn_blocking(move || {
+        sandbox_allocations_allocation_id_get_validation(header_params, path_params)
+    })
+    .await
+    .unwrap();
+
+    let Ok((header_params, path_params)) = validation else {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from(validation.unwrap_err().to_string()))
+            .map_err(|_| StatusCode::BAD_REQUEST);
+    };
+
+    let result = api_impl
+        .as_ref()
+        .sandbox_allocations_allocation_id_get(
+            &method,
+            &host,
+            &cookies,
+            &claims,
+            &header_params,
+            &path_params,
+        )
+        .await;
+
+    let mut response = Response::builder();
+
+    let resp = match result {
+                                            Ok(rsp) => match rsp {
+                                                apis::sandboxes::SandboxAllocationsAllocationIdGetResponse::Status200_AllocationReceipt
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(200);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::sandboxes::SandboxAllocationsAllocationIdGetResponse::Status400_BadRequest
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(400);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::sandboxes::SandboxAllocationsAllocationIdGetResponse::Status401_AuthenticationError
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(401);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::sandboxes::SandboxAllocationsAllocationIdGetResponse::Status404_NotFound
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(404);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::sandboxes::SandboxAllocationsAllocationIdGetResponse::Status409_Conflict
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(409);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::sandboxes::SandboxAllocationsAllocationIdGetResponse::Status500_ServerError
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(500);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                            },
+                                            Err(why) => {
+                                                    // Application code returned an error. This should not happen, as the implementation should
+                                                    // return a valid response.
+                                                    return api_impl.as_ref().handle_error(&method, &host, &cookies, why).await;
+                                            },
+                                        };
+
+    resp.map_err(|e| {
+        error!(error = ?e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+#[derive(validator::Validate)]
+#[allow(dead_code)]
+struct SandboxAllocationsAllocationIdPostBodyValidator<'a> {
+    #[validate(nested)]
+    body: &'a models::NewSandbox,
+}
+
+#[tracing::instrument(skip_all)]
+fn sandbox_allocations_allocation_id_post_validation(
+    header_params: models::SandboxAllocationsAllocationIdPostHeaderParams,
+    path_params: models::SandboxAllocationsAllocationIdPostPathParams,
+    body: models::NewSandbox,
+) -> std::result::Result<
+    (
+        models::SandboxAllocationsAllocationIdPostHeaderParams,
+        models::SandboxAllocationsAllocationIdPostPathParams,
+        models::NewSandbox,
+    ),
+    ValidationErrors,
+> {
+    header_params.validate()?;
+    path_params.validate()?;
+    let b = SandboxAllocationsAllocationIdPostBodyValidator { body: &body };
+    b.validate()?;
+
+    Ok((header_params, path_params, body))
+}
+/// SandboxAllocationsAllocationIdPost - POST /sandbox-allocations/{allocationID}
+#[tracing::instrument(skip_all)]
+async fn sandbox_allocations_allocation_id_post<I, A, E, C>(
+    method: Method,
+    TypedHeader(host): TypedHeader<Host>,
+    cookies: CookieJar,
+    headers: HeaderMap,
+    Path(path_params): Path<models::SandboxAllocationsAllocationIdPostPathParams>,
+    State(api_impl): State<I>,
+    Json(body): Json<models::NewSandbox>,
+) -> Result<Response, StatusCode>
+where
+    I: AsRef<A> + Send + Sync,
+    A: apis::sandboxes::Sandboxes<E, Claims = C> + apis::ApiKeyAuthHeader<Claims = C> + Send + Sync,
+    E: std::fmt::Debug + Send + Sync + 'static,
+{
+    // Authentication
+    let claims_in_header = api_impl
+        .as_ref()
+        .extract_claims_from_header(&headers, "X-API-Key")
+        .await;
+    let claims = None.or(claims_in_header);
+    let Some(claims) = claims else {
+        return response_with_status_code_only(StatusCode::UNAUTHORIZED);
+    };
+
+    // Header parameters
+    let header_params = {
+        let header_x_agentenv_allocation_owner =
+            headers.get(HeaderName::from_static("x-agentenv-allocation-owner"));
+
+        let header_x_agentenv_allocation_owner = match header_x_agentenv_allocation_owner {
+            Some(v) => match header::IntoHeaderValue::<String>::try_from((*v).clone()) {
+                Ok(result) => result.0,
+                Err(err) => {
+                    return Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Body::from(format!(
+                            "Invalid header X-Agentenv-Allocation-Owner - {err}"
+                        )))
+                        .map_err(|e| {
+                            error!(error = ?e);
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        });
+                }
+            },
+            None => {
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Body::from(
+                        "Missing required header X-Agentenv-Allocation-Owner",
+                    ))
+                    .map_err(|e| {
+                        error!(error = ?e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    });
+            }
+        };
+
+        models::SandboxAllocationsAllocationIdPostHeaderParams {
+            x_agentenv_allocation_owner: header_x_agentenv_allocation_owner,
+        }
+    };
+
+    #[allow(clippy::redundant_closure)]
+    let validation = tokio::task::spawn_blocking(move || {
+        sandbox_allocations_allocation_id_post_validation(header_params, path_params, body)
+    })
+    .await
+    .unwrap();
+
+    let Ok((header_params, path_params, body)) = validation else {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from(validation.unwrap_err().to_string()))
+            .map_err(|_| StatusCode::BAD_REQUEST);
+    };
+
+    let result = api_impl
+        .as_ref()
+        .sandbox_allocations_allocation_id_post(
+            &method,
+            &host,
+            &cookies,
+            &claims,
+            &header_params,
+            &path_params,
+            &body,
+        )
+        .await;
+
+    let mut response = Response::builder();
+
+    let resp = match result {
+                                            Ok(rsp) => match rsp {
+                                                apis::sandboxes::SandboxAllocationsAllocationIdPostResponse::Status201_TheSandboxWasCreatedSuccessfully
+                                                    {
+                                                        body,
+                                                        x_agentenv_sandbox_id
+                                                    }
+                                                => {
+                                                    if let Some(x_agentenv_sandbox_id) = x_agentenv_sandbox_id {
+                                                    let x_agentenv_sandbox_id = match header::IntoHeaderValue(x_agentenv_sandbox_id).try_into() {
+                                                        Ok(val) => val,
+                                                        Err(e) => {
+                                                            return Response::builder()
+                                                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                                    .body(Body::from(format!("An internal server error occurred handling x_agentenv_sandbox_id header - {e}"))).map_err(|e| { error!(error = ?e); StatusCode::INTERNAL_SERVER_ERROR });
+                                                        }
+                                                    };
+
+
+                                                    {
+                                                      let mut response_headers = response.headers_mut().unwrap();
+                                                      response_headers.insert(
+                                                          HeaderName::from_static("x-agentenv-sandbox-id"),
+                                                          x_agentenv_sandbox_id
+                                                      );
+                                                    }
+                                                    }
+                                                  let mut response = response.status(201);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::sandboxes::SandboxAllocationsAllocationIdPostResponse::Status401_AuthenticationError
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(401);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::sandboxes::SandboxAllocationsAllocationIdPostResponse::Status400_BadRequest
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(400);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::sandboxes::SandboxAllocationsAllocationIdPostResponse::Status409_Conflict
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(409);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::sandboxes::SandboxAllocationsAllocationIdPostResponse::Status500_ServerError
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(500);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                            },
+                                            Err(why) => {
+                                                    // Application code returned an error. This should not happen, as the implementation should
+                                                    // return a valid response.
+                                                    return api_impl.as_ref().handle_error(&method, &host, &cookies, why).await;
+                                            },
+                                        };
 
     resp.map_err(|e| {
         error!(error = ?e);

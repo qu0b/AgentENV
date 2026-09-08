@@ -57,6 +57,17 @@ where
     let api_impl = api_impl.as_ref();
     if !proxy_request {
         return if api_impl.has_valid_api_key(request.headers()) {
+            if request.uri().path().starts_with("/sandbox-allocations/")
+                && request
+                    .headers()
+                    .get_all("x-agentenv-allocation-owner")
+                    .iter()
+                    .count()
+                    > 1
+            {
+                return (StatusCode::BAD_REQUEST, "allocation owner must occur once")
+                    .into_response();
+            }
             next.run(request).await
         } else {
             StatusCode::UNAUTHORIZED.into_response()

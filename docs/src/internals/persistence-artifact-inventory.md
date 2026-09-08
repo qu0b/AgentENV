@@ -2,6 +2,11 @@
 
 This document lists AgentENV artifacts that can remain on disk or in object storage beyond a single function call. It is organized by the module that owns each artifact's lifecycle.
 
+Keyed create receipts and cancellation tombstones are retained in
+`<persisted_sandbox_store_path>/allocations.db`. They are not paused-sandbox
+records or a rebuildable cache. See [durable sandbox allocations](sandbox-allocations.md)
+for their ownership, retention, and crash-recovery contract.
+
 ## Path Roots
 
 | Root | Default | Owner | Notes |

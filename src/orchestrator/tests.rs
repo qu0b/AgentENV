@@ -1198,6 +1198,67 @@ fn write_local_commit_image_config(path: &Path, file: &Path, digest: &str, size:
 }
 
 #[tokio::test]
+async fn allocation_journal_id_is_the_actual_created_sandbox_identity() {
+    use crate::allocation::{AllocationJournal, AllocationResult, AllocationState};
+    let temp = tempfile::tempdir().unwrap();
+    let journal = AllocationJournal::open(temp.path()).await.unwrap();
+    let orchestrator = make_orchestrator_without_background(InMemoryMetadataStore::new());
+    let worker = Arc::clone(&orchestrator);
+    let id = Uuid::now_v7();
+    let metadata = match journal
+        .execute(id, "a".repeat(64), move |sandbox_id| async move {
+            worker
+                .create_sandbox_with_id(
+                    sandbox_id,
+                    create_request(Some(60), &[("allocationId", &id.to_string())]),
+                )
+                .await
+        })
+        .await
+        .unwrap()
+    {
+        AllocationResult::Completed(result) => result.unwrap(),
+        AllocationResult::Existing(_) => panic!("first allocation was already claimed"),
+    };
+    let receipt = journal.get(id).await.unwrap().unwrap();
+    assert_eq!(receipt.state, AllocationState::Settled);
+    assert_eq!(receipt.sandbox_id, Some(metadata.id));
+    assert_eq!(metadata.state, SandboxState::Running);
+    assert_eq!(
+        metadata.user_metadata.as_ref().unwrap().get("allocationId"),
+        Some(&id.to_string())
+    );
+    assert_eq!(
+        orchestrator
+            .store
+            .get(&metadata.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        metadata.id
+    );
+    assert!(matches!(
+        journal
+            .execute(id, "a".repeat(64), |_| async { panic!("duplicate VM") })
+            .await
+            .unwrap(),
+        AllocationResult::Existing(_)
+    ));
+    assert_eq!(
+        current_metrics(&orchestrator).await.running_sandbox_count,
+        1
+    );
+    orchestrator.delete_sandbox(metadata.id).await.unwrap();
+    assert!(orchestrator
+        .store
+        .get(&metadata.id)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn create_sandbox_from_image_uses_fresh_launch_metadata() -> Result<()> {
     setup();
     let behavior = Arc::new(MockBehavior::new());
