@@ -219,23 +219,43 @@ impl FirecrackerInstance {
             "stopping firecracker process"
         );
 
-        if let Some(mut child) = self.process.take() {
-            // First try a graceful stop with SIGTERM
-            if let Some(pid) = child.id() {
-                trace!(pid, "sending SIGTERM to firecracker");
-                let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+        // Keep the original Child until exit is observed. A caller may cancel
+        // this future at either wait; taking the handle before awaiting would
+        // turn the next stop into a false confirmation with no process handle.
+        if let Some(child) = self.process.as_mut() {
+            if child
+                .try_wait()
+                .context("inspect firecracker exit before stop")?
+                .is_none()
+            {
+                if let Some(pid) = child.id() {
+                    trace!(pid, "sending SIGTERM to firecracker");
+                    match kill(Pid::from_raw(pid as i32), Signal::SIGTERM) {
+                        Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+                        Err(error) => return Err(error).context("signal firecracker stop"),
+                    }
+                }
+                match time::timeout(timeout, child.wait()).await {
+                    Ok(exit) => {
+                        exit.context("wait for firecracker stop")?;
+                    }
+                    Err(_) => {
+                        warn!("firecracker stop timed out; sending SIGKILL");
+                        child.start_kill().context("force firecracker stop")?;
+                        time::timeout(timeout, child.wait())
+                            .await
+                            .context("timed out confirming forced firecracker stop")?
+                            .context("wait for forced firecracker stop")?;
+                    }
+                }
             }
-
-            // Wait for the process to exit, but if it doesn't within the timeout, force kill it with SIGKILL
-            if time::timeout(timeout, child.wait()).await.is_err() {
-                warn!("firecracker stop timed out; sending SIGKILL");
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-            }
+            self.process = None;
         }
 
-        if self.socket_path.exists() {
-            let _ = fs::remove_file(&self.socket_path);
+        match fs::remove_file(&self.socket_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("remove stopped firecracker socket"),
         }
         debug!("firecracker process stopped");
         Ok(())
@@ -664,6 +684,63 @@ mod tests {
         instance.stop(Duration::from_millis(10)).await?;
 
         assert!(!instance.socket_path.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_stop_contract_reports_socket_cleanup_failure_and_retries() -> Result<()> {
+        let temp = tempdir()?;
+        let mut instance = FirecrackerInstance::new(temp.path().to_path_buf());
+        fs::create_dir(&instance.socket_path)?;
+        let failed = instance.stop(Duration::from_millis(50)).await;
+        assert!(
+            failed.is_err(),
+            "stop must not confirm failed socket cleanup"
+        );
+        assert!(instance.socket_path.is_dir());
+        fs::remove_dir(&instance.socket_path)?;
+        fs::write(&instance.socket_path, b"original owned socket")?;
+        instance.stop(Duration::from_millis(50)).await?;
+        assert!(!instance.socket_path.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_stop_contract_keeps_child_when_stop_future_is_cancelled() -> Result<()> {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let temp = tempdir()?;
+        let mut instance = FirecrackerInstance::new(temp.path().to_path_buf());
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "trap '' TERM; printf 'ready\\n'; exec sleep 60"])
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        let mut ready = String::new();
+        BufReader::new(child.stdout.take().expect("child stdout"))
+            .read_line(&mut ready)
+            .await?;
+        assert_eq!(ready, "ready\n");
+        let pid = child.id();
+        instance.process = Some(child);
+        assert!(time::timeout(
+            Duration::from_millis(25),
+            instance.stop(Duration::from_secs(10))
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            instance.process.as_ref().and_then(Child::id),
+            pid,
+            "cancelling a wait must retain the identical child for retry"
+        );
+        assert!(instance
+            .process
+            .as_mut()
+            .expect("retained child")
+            .try_wait()?
+            .is_none());
+        instance.stop(Duration::from_millis(100)).await?;
+        assert!(instance.process.is_none());
         Ok(())
     }
 

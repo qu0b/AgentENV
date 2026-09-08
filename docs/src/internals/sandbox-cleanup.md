@@ -26,6 +26,28 @@ These guarantees depend on the backend's `stop()` contract. Tests using a mock
 backend establish orchestrator ordering, not that Firecracker, ublk, network
 namespaces, mounts, and volumes have physically converged on a target host.
 
+### Firecracker process-stop confirmation
+
+The native process wrapper keeps its original child handle until process exit
+is observed. Cancelling either stop wait therefore retains the same child for
+retry. Signal, wait and socket-removal failures propagate; both graceful and
+forced waits are bounded. A stale socket that cannot be removed cannot become
+a successful stop. Previously the wrapper took the child before awaiting and
+ignored wait/cleanup errors, so cancellation lost its retry owner and filesystem
+failure returned success.
+
+Real subprocess and filesystem tests reproduce both failures against the
+preceding implementation. The fixed process contract does not yet establish the
+full native cleanup contract: `FirecrackerSandbox::stop` still logs and discards
+failed ublk releases, and a failed network-slot cleanup can release its bitmap
+reservation. These require further correction before native failure acceptance.
+Do not add blind device-release retries: the daemon currently accepts a numeric
+device ID without an acquisition identity. An interrupted release can have
+succeeded; a later retry could target a reused device or decrement another
+shared acquisition. Lease-scoped release identity and outcome reconciliation
+must precede such retries. Missing in-memory handles remain insufficient proof
+after process death.
+
 ## Delete and restart
 
 Before deleting a runtime or artifacts, the persister synchronously writes a
