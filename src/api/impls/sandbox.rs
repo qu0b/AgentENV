@@ -123,14 +123,15 @@ struct PreparedVolumeMounts {
 }
 
 async fn prepare_volume_mounts(
-    api: &ApiImpl,
+    manager: &VolumeManager,
     mounts: Option<&HashMap<String, String>>,
+    sandbox_id: SandboxId,
 ) -> Result<PreparedVolumeMounts, models::Error> {
     let Some(mounts) = mounts.filter(|mounts| !mounts.is_empty()) else {
         return Ok(PreparedVolumeMounts::default());
     };
-    let owner = format!("pending-{}", Uuid::now_v7().simple());
-    let (drives, mounts) = resolve_volume_mounts(&api.volume_manager, mounts, &owner).await?;
+    let owner = sandbox_id.to_string();
+    let (drives, mounts) = resolve_volume_mounts(manager, mounts, &owner).await?;
     Ok(PreparedVolumeMounts {
         owner: Some(owner),
         drives,
@@ -139,17 +140,28 @@ async fn prepare_volume_mounts(
     })
 }
 
-async fn finish_volume_reservation(
+async fn release_failed_create_volumes(
     manager: &VolumeManager,
     owner: Option<&str>,
-    sandbox_id: Option<SandboxId>,
+    runtime_stopped: bool,
     volume_ids: &[String],
+    restored_volume_ids: &[String],
 ) -> Result<(), crate::volume::VolumeError> {
-    let Some(owner) = owner else { return Ok(()) };
-    let sandbox_id = sandbox_id.map(|id| id.to_string());
-    manager
-        .replace_owner_for(owner, sandbox_id.as_deref(), volume_ids)
-        .await
+    if !runtime_stopped {
+        // The original sandbox ID remains the durable volume owner. Its
+        // cleanup_pending record can retry deletion without an owner handoff.
+        return Ok(());
+    }
+    if let Some(owner) = owner {
+        manager
+            .recover_and_publish_backings(owner, volume_ids)
+            .await?;
+        manager.replace_owner_for(owner, None, volume_ids).await?;
+    }
+    for volume_id in restored_volume_ids {
+        manager.delete(volume_id).await?;
+    }
+    Ok(())
 }
 
 async fn cleanup_fork_volume_children(
@@ -561,11 +573,17 @@ impl ApiImpl {
             }
         };
         let PreparedVolumeMounts {
-            owner: pending_volume_owner,
+            owner: volume_owner,
             drives: volume_drives,
             mounts: volume_mounts,
             volume_ids: reserved_volume_ids,
-        } = match prepare_volume_mounts(self, requested_volume_mounts.as_ref()).await {
+        } = match prepare_volume_mounts(
+            &self.volume_manager,
+            requested_volume_mounts.as_ref(),
+            sandbox_id,
+        )
+        .await
+        {
             Ok(prepared) => prepared,
             Err(error) => {
                 cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
@@ -598,36 +616,18 @@ impl ApiImpl {
             volume_mounts,
         };
 
-        match timer
+        let outcome = timer
             .time(
                 "create_sandbox",
-                self.orchestrator
-                    .create_sandbox_with_id(sandbox_id, request),
+                self.orchestrator.create_sandbox_with_cleanup_outcome(
+                    sandbox_id,
+                    request,
+                    restored_volume_ids.clone(),
+                ),
             )
-            .await
-        {
+            .await;
+        match outcome {
             Ok(metadata) => {
-                if let Err(error) = finish_volume_reservation(
-                    &self.volume_manager,
-                    pending_volume_owner.as_deref(),
-                    Some(metadata.id),
-                    &reserved_volume_ids,
-                )
-                .await
-                {
-                    let _ = self.orchestrator.delete_sandbox(metadata.id).await;
-                    if let Some(owner) = pending_volume_owner.as_deref() {
-                        let _ = self
-                            .volume_manager
-                            .replace_owner_for(owner, None, &reserved_volume_ids)
-                            .await;
-                    }
-                    cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
-                    return Ok(SandboxesPostResponse::Status500_ServerError(Self::error(
-                        500,
-                        format!("failed to finalize volume reservation: {error}"),
-                    )));
-                }
                 let sandbox_id = metadata.id.to_string();
                 Ok(
                     SandboxesPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
@@ -636,15 +636,19 @@ impl ApiImpl {
                     },
                 )
             }
-            Err(err) => {
-                let _ = finish_volume_reservation(
+            Err(failure) => {
+                let err = failure.error;
+                if let Err(cleanup_error) = release_failed_create_volumes(
                     &self.volume_manager,
-                    pending_volume_owner.as_deref(),
-                    None,
+                    volume_owner.as_deref(),
+                    failure.runtime_stopped,
                     &reserved_volume_ids,
+                    &restored_volume_ids,
                 )
-                .await;
-                cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
+                .await
+                {
+                    warn!(%sandbox_id, %cleanup_error, "failed create retains volume cleanup debt");
+                }
                 Ok(SandboxesPostResponse::Status500_ServerError(
                     Self::internal_error(&err),
                 ))
@@ -1104,12 +1108,19 @@ impl Sandboxes<()> for ApiImpl {
             ));
         }
 
+        let sandbox_id = SandboxId::new();
         let PreparedVolumeMounts {
-            owner: pending_volume_owner,
+            owner: volume_owner,
             drives: volume_drives,
             mounts: volume_mounts,
             volume_ids: reserved_volume_ids,
-        } = match prepare_volume_mounts(self, body.volume_mounts.as_ref()).await {
+        } = match prepare_volume_mounts(
+            &self.volume_manager,
+            body.volume_mounts.as_ref(),
+            sandbox_id,
+        )
+        .await
+        {
             Ok(prepared) => prepared,
             Err(error) if error.code >= 500 => {
                 return Ok(SandboxesColdPostResponse::Status500_ServerError(error));
@@ -1162,33 +1173,18 @@ impl Sandboxes<()> for ApiImpl {
             volume_mounts,
         };
 
-        match timer
-            .time("create_sandbox", self.orchestrator.create_sandbox(request))
-            .await
-        {
+        let outcome = timer
+            .time(
+                "create_sandbox",
+                self.orchestrator.create_sandbox_with_cleanup_outcome(
+                    sandbox_id,
+                    request,
+                    Vec::new(),
+                ),
+            )
+            .await;
+        match outcome {
             Ok(metadata) => {
-                if let Err(error) = finish_volume_reservation(
-                    &self.volume_manager,
-                    pending_volume_owner.as_deref(),
-                    Some(metadata.id),
-                    &reserved_volume_ids,
-                )
-                .await
-                {
-                    let _ = self.orchestrator.delete_sandbox(metadata.id).await;
-                    if let Some(owner) = pending_volume_owner.as_deref() {
-                        let _ = self
-                            .volume_manager
-                            .replace_owner_for(owner, None, &reserved_volume_ids)
-                            .await;
-                    }
-                    return Ok(SandboxesColdPostResponse::Status500_ServerError(
-                        Self::error(
-                            500,
-                            format!("failed to finalize volume reservation: {error}"),
-                        ),
-                    ));
-                }
                 let sandbox_id = metadata.id.to_string();
                 Ok(
                     SandboxesColdPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
@@ -1197,14 +1193,19 @@ impl Sandboxes<()> for ApiImpl {
                     },
                 )
             }
-            Err(err) => {
-                let _ = finish_volume_reservation(
+            Err(failure) => {
+                let err = failure.error;
+                if let Err(cleanup_error) = release_failed_create_volumes(
                     &self.volume_manager,
-                    pending_volume_owner.as_deref(),
-                    None,
+                    volume_owner.as_deref(),
+                    failure.runtime_stopped,
                     &reserved_volume_ids,
+                    &[],
                 )
-                .await;
+                .await
+                {
+                    warn!(%sandbox_id, %cleanup_error, "failed create retains volume cleanup debt");
+                }
                 let invalid_request = match &err {
                     OrchestratorError::SandboxOperationFailed { source, .. } => {
                         source.chain().find_map(|cause| {
@@ -2123,6 +2124,257 @@ impl Sandboxes<()> for ApiImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_create_keeps_final_volume_owner_until_runtime_cleanup_is_confirmed(
+    ) -> anyhow::Result<()> {
+        use crate::orchestrator::{
+            FileBackedSandboxPersister, InMemoryMetadataStore, Orchestrator,
+        };
+        use crate::sandbox::mock::{MockAction, MockBackendFactory, MockBehavior, MockOperation};
+        use crate::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
+        use crate::snapshot::{ExternalLayer, OverlaybdLayerRef, RunnableSnapshot};
+        use crate::volume::{VolumeError, VolumeMode};
+        use std::sync::Arc;
+
+        for mode in [VolumeMode::Exclusive, VolumeMode::ReadOnly] {
+            for operation in [
+                None,
+                Some(MockOperation::Build),
+                Some(MockOperation::StartNowait),
+                Some(MockOperation::WaitForReady),
+            ] {
+                for (stop_fails, restored) in
+                    [(false, false), (true, false), (false, true), (true, true)]
+                {
+                    if (operation.is_none() || operation == Some(MockOperation::Build))
+                        && stop_fails
+                    {
+                        continue;
+                    }
+                    let root = tempfile::tempdir()?;
+                    let backend = PosixFsBackend::new(PosixFsBackendConfig {
+                        root: root.path().join("repository"),
+                        cache_root: Some(root.path().join("cache")),
+                        runtime_cache_root: Some(root.path().join("runtime")),
+                    })?;
+                    let catalog = root.path().join("volumes/catalog");
+                    let manager = Arc::new(
+                        VolumeManager::open_with_repository(&catalog, backend.repository()).await?,
+                    );
+                    let volume = manager
+                        .create_from_snapshot(
+                            "original-exclusive-volume".into(),
+                            mode,
+                            64,
+                            vec![OverlaybdLayerRef::External(ExternalLayer {
+                                digest: format!("sha256:{}", "a".repeat(64)),
+                                size: 4096,
+                                repo_blob_url: "https://volume-fixture.invalid/blobs/".into(),
+                            })],
+                        )
+                        .await?;
+                    let restored_ids = if restored {
+                        vec![volume.id.clone()]
+                    } else {
+                        Vec::new()
+                    };
+                    if mode == VolumeMode::ReadOnly && !restored {
+                        manager.reserve(&volume.id, "other-reader").await?;
+                    }
+                    let sandbox_id = SandboxId::new();
+                    let prepared = prepare_volume_mounts(
+                        &manager,
+                        Some(&HashMap::from([("/data".into(), volume.id.clone())])),
+                        sandbox_id,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e.message))?;
+                    assert_eq!(
+                        prepared.owner.as_deref(),
+                        Some(sandbox_id.to_string().as_str())
+                    );
+                    assert!(manager
+                        .get(&volume.id)
+                        .await?
+                        .mounted_by(&sandbox_id.to_string()));
+                    let behavior = Arc::new(MockBehavior::new());
+                    if let Some(operation) = operation {
+                        behavior.push_action(
+                            operation,
+                            MockAction::Fail {
+                                message: "create failed".into(),
+                            },
+                        );
+                    }
+                    if stop_fails {
+                        behavior.push_action(
+                            MockOperation::Stop,
+                            MockAction::Fail {
+                                message: "VM still alive".into(),
+                            },
+                        );
+                    }
+                    let persister =
+                        FileBackedSandboxPersister::new_for_test(root.path().join("sandboxes"));
+                    let mut orchestrator = Orchestrator::new_with_volumes(
+                        InMemoryMetadataStore::new(),
+                        MockBackendFactory::with_behavior(behavior.clone()),
+                        persister,
+                        manager.clone(),
+                    )
+                    .await?;
+                    let outcome = orchestrator
+                        .create_sandbox_with_cleanup_outcome(
+                            sandbox_id,
+                            CreateSandboxRequest {
+                                source: SandboxLaunchSource::Snapshot(Box::new(
+                                    RunnableSnapshot::mock(),
+                                )),
+                                extra_drives: prepared.drives,
+                                extra_drives_in_snapshot: false,
+                                timeout: Some(Duration::from_secs(60)),
+                                timeout_action: SandboxTimeoutAction::Delete,
+                                auto_resume: false,
+                                user_metadata: None,
+                                env_vars: None,
+                                network_policy: Default::default(),
+                                secure: false,
+                                custom_extension_params: None,
+                                volume_mounts: prepared.mounts,
+                            },
+                            restored_ids.clone(),
+                        )
+                        .await;
+                    let failure = match outcome {
+                        Ok(metadata) => {
+                            assert!(operation.is_none());
+                            assert!(metadata.volumes_created_for_launch.is_empty());
+                            orchestrator.delete_sandbox(sandbox_id).await?;
+                            let record = manager.get(&volume.id).await?;
+                            assert!(!record.mounted_by(&sandbox_id.to_string()));
+                            if mode == VolumeMode::ReadOnly && !restored {
+                                assert!(record.mounted_by("other-reader"));
+                            }
+                            orchestrator.shutdown().await?;
+                            continue;
+                        }
+                        Err(failure) => {
+                            assert!(operation.is_some());
+                            failure
+                        }
+                    };
+                    assert_eq!(failure.runtime_stopped, !stop_fails);
+                    release_failed_create_volumes(
+                        &manager,
+                        prepared.owner.as_deref(),
+                        failure.runtime_stopped,
+                        &prepared.volume_ids,
+                        &restored_ids,
+                    )
+                    .await?;
+                    let fresh =
+                        VolumeManager::open_with_repository(&catalog, backend.repository()).await?;
+                    if stop_fails {
+                        assert!(fresh
+                            .get(&volume.id)
+                            .await?
+                            .mounted_by(&sandbox_id.to_string()));
+                        if mode == VolumeMode::Exclusive {
+                            assert!(matches!(
+                                fresh.reserve(&volume.id, "replacement-vm").await,
+                                Err(VolumeError::Reserved(_))
+                            ));
+                        }
+                        assert!(matches!(
+                            fresh.delete(&volume.id).await,
+                            Err(VolumeError::Reserved(_))
+                        ));
+                        assert_eq!(
+                            orchestrator.get_sandbox(&sandbox_id).await?.unwrap().state,
+                            SandboxState::CleanupPending
+                        );
+                        if restored {
+                            use std::os::unix::fs::PermissionsExt;
+                            let blocked = root
+                                .path()
+                                .join("sandboxes/artifacts")
+                                .join(sandbox_id.to_string())
+                                .join("locked");
+                            std::fs::create_dir_all(&blocked)?;
+                            std::fs::write(blocked.join("evidence"), b"cleanup retry evidence")?;
+                            std::fs::set_permissions(
+                                &blocked,
+                                std::fs::Permissions::from_mode(0o500),
+                            )?;
+                            let attempt = orchestrator.delete_sandbox(sandbox_id).await;
+                            std::fs::set_permissions(
+                                &blocked,
+                                std::fs::Permissions::from_mode(0o700),
+                            )?;
+                            assert!(
+                                attempt.is_err(),
+                                "artifact failure must retain deletion debt"
+                            );
+                            assert!(matches!(
+                                fresh.get(&volume.id).await,
+                                Err(VolumeError::NotFound(_))
+                            ));
+                            let previous = Arc::downgrade(&orchestrator);
+                            drop(orchestrator);
+                            for _ in 0..100 {
+                                if previous.upgrade().is_none() {
+                                    break;
+                                }
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                            assert!(
+                                previous.upgrade().is_none(),
+                                "old orchestrator must stop before reopening state"
+                            );
+                            orchestrator = Orchestrator::new_with_volumes(
+                                InMemoryMetadataStore::new(),
+                                MockBackendFactory::new(),
+                                FileBackedSandboxPersister::new_for_test(
+                                    root.path().join("sandboxes"),
+                                ),
+                                manager.clone(),
+                            )
+                            .await?;
+                            let loaded = orchestrator.get_sandbox(&sandbox_id).await?.unwrap();
+                            assert!(loaded.runtime_stopped);
+                            assert_eq!(loaded.volumes_created_for_launch, restored_ids);
+                        }
+                        orchestrator.delete_sandbox(sandbox_id).await?;
+                    }
+                    let released =
+                        VolumeManager::open_with_repository(&catalog, backend.repository()).await?;
+                    if restored {
+                        assert!(matches!(
+                            released.get(&volume.id).await,
+                            Err(VolumeError::NotFound(_))
+                        ));
+                    } else {
+                        let record = released.get(&volume.id).await?;
+                        assert!(!record.mounted_by(&sandbox_id.to_string()));
+                        if mode == VolumeMode::ReadOnly {
+                            assert!(record.mounted_by("other-reader"));
+                        }
+                        released.reserve(&volume.id, "replacement-vm").await?;
+                        released
+                            .replace_owner_for(
+                                "replacement-vm",
+                                None,
+                                std::slice::from_ref(&volume.id),
+                            )
+                            .await?;
+                    }
+                    orchestrator.shutdown().await?;
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn parse_metadata_filter_with_none_returns_none() {

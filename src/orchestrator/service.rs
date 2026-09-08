@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use std::time::{Duration, SystemTime};
@@ -38,6 +38,15 @@ use super::types::{
 use super::{OrchestratorError, Result, SandboxForkOutcome, SandboxOperation};
 
 type SandboxHandle = Arc<Mutex<Box<dyn SandboxBackend>>>;
+
+/// Evidence returned by the owned create attempt, never inferred from a later
+/// inventory lookup. A failed attempt can release volume ownership only when
+/// its runtime never started or its backend explicitly confirmed stop.
+#[derive(Debug)]
+pub(crate) struct SandboxCreateFailure {
+    pub error: OrchestratorError,
+    pub runtime_stopped: bool,
+}
 
 /// Maximum time to wait for a sandbox to leave a transitional state.
 /// Guards against indefinite blocking when a sandbox's in-progress operation
@@ -147,9 +156,7 @@ where
             config.orchestrator.persisted_sandbox_store_path.clone(),
             config.virtualization_mode,
         );
-        let image_refs = local_image_services_from_global_config().runtime_refs;
-        Self::new_inner_with_volumes(store, factory, persister, image_refs, Some(volume_manager))
-            .await
+        Self::new_with_volumes(store, factory, persister, volume_manager).await
     }
 }
 
@@ -162,6 +169,17 @@ where
     pub async fn new(store: S, factory: F, persister: P) -> Result<Arc<Self>> {
         let image_refs = local_image_services_from_global_config().runtime_refs;
         Self::new_inner(store, factory, persister, image_refs).await
+    }
+
+    pub(crate) async fn new_with_volumes(
+        store: S,
+        factory: F,
+        persister: P,
+        volume_manager: Arc<VolumeManager>,
+    ) -> Result<Arc<Self>> {
+        let image_refs = local_image_services_from_global_config().runtime_refs;
+        Self::new_inner_with_volumes(store, factory, persister, image_refs, Some(volume_manager))
+            .await
     }
 
     async fn new_inner(
@@ -414,11 +432,41 @@ where
         sandbox_id: SandboxId,
         request: CreateSandboxRequest,
     ) -> Result<SandboxMetadata> {
+        self.create_sandbox_with_cleanup_outcome(sandbox_id, request, Vec::new())
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    pub(crate) async fn create_sandbox_with_cleanup_outcome(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        request: CreateSandboxRequest,
+        volumes_created_for_launch: Vec<String>,
+    ) -> std::result::Result<SandboxMetadata, SandboxCreateFailure> {
         let this = Arc::clone(self);
-        self.run_cancellation_safe("create", sandbox_id, async move {
-            this.create_sandbox_inner(sandbox_id, request).await
+        let outcome = self
+            .run_cancellation_safe("create", sandbox_id, async move {
+                let runtime_stopped = Arc::new(AtomicBool::new(true));
+                let result = this
+                    .create_sandbox_inner(
+                        sandbox_id,
+                        request,
+                        runtime_stopped.clone(),
+                        volumes_created_for_launch,
+                    )
+                    .await;
+                Ok(result.map_err(|error| SandboxCreateFailure {
+                    error,
+                    runtime_stopped: runtime_stopped.load(Ordering::Acquire),
+                }))
+            })
+            .await;
+        outcome.unwrap_or_else(|error| {
+            Err(SandboxCreateFailure {
+                error,
+                runtime_stopped: false,
+            })
         })
-        .await
     }
 
     #[tracing::instrument(
@@ -430,6 +478,8 @@ where
         self: Arc<Self>,
         sandbox_id: SandboxId,
         request: CreateSandboxRequest,
+        runtime_stopped: Arc<AtomicBool>,
+        volumes_created_for_launch: Vec<String>,
     ) -> Result<SandboxMetadata> {
         if let Err(err) = self.ensure_accepting_lifecycle_operations() {
             self.counters.record_create_fail(1);
@@ -506,6 +556,7 @@ where
                     network_policy,
                     custom_extension_params: effective_custom_extension_params,
                     volume_mounts: volume_mounts.clone(),
+                    volumes_created_for_launch,
                     secure,
                     ..Default::default()
                 };
@@ -516,6 +567,7 @@ where
                     launch_config,
                     transitional_metadata,
                     NewTimeout::Set(timeout.unwrap_or(self.default_sandbox_timeout)),
+                    runtime_stopped,
                 ))
                 .await
             }
@@ -570,6 +622,7 @@ where
                     network_policy,
                     custom_extension_params,
                     volume_mounts,
+                    volumes_created_for_launch,
                     secure,
                     ..Default::default()
                 };
@@ -580,6 +633,7 @@ where
                     launch_config,
                     transitional_metadata,
                     NewTimeout::Set(timeout.unwrap_or(self.default_sandbox_timeout)),
+                    runtime_stopped,
                 ))
                 .await
             }
@@ -1258,6 +1312,24 @@ where
             })?;
 
         if let Some(manager) = self.volume_manager.as_ref() {
+            // A previous cleanup pass may have deleted some launch-owned
+            // volumes before a later filesystem or record write failed.
+            let mut remaining_volume_ids = Vec::with_capacity(volume_ids.len());
+            for volume_id in &volume_ids {
+                match manager.get(volume_id).await {
+                    Ok(_) => remaining_volume_ids.push(volume_id.clone()),
+                    Err(crate::volume::VolumeError::NotFound(_))
+                        if metadata.volumes_created_for_launch.contains(volume_id) => {}
+                    Err(source) => {
+                        return Err(OrchestratorError::SandboxOperationFailed {
+                            sandbox_id,
+                            operation: SandboxOperation::Stop,
+                            source: source.into(),
+                        })
+                    }
+                }
+            }
+            let volume_ids = remaining_volume_ids;
             self.publish_sandbox_volume_backings(sandbox_id, &volume_ids)
                 .await?;
             if let Err(err) = manager
@@ -1269,6 +1341,18 @@ where
                     operation: SandboxOperation::Stop,
                     source: err.into(),
                 });
+            }
+            for volume_id in &metadata.volumes_created_for_launch {
+                match manager.delete(volume_id).await {
+                    Ok(()) | Err(crate::volume::VolumeError::NotFound(_)) => {}
+                    Err(source) => {
+                        return Err(OrchestratorError::SandboxOperationFailed {
+                            sandbox_id,
+                            operation: SandboxOperation::Stop,
+                            source: source.into(),
+                        })
+                    }
+                }
             }
         }
 
@@ -2450,6 +2534,9 @@ where
                 .await;
             return Err(err);
         }
+        if let LaunchPlan::Create(create) = &plan {
+            create.runtime_stopped.store(false, Ordering::Release);
+        }
         if let Err(source) = sandbox.start_nowait().await {
             warn!(error = %format_args!("{source:#}"), "failed to start sandbox");
             self.stop_early_failed_launch(&plan, sandbox, transitional_state)
@@ -2558,6 +2645,7 @@ where
                     metadata.resources = runtime_resources;
                     metadata.state = SandboxState::Running;
                     metadata.runtime_stopped = false;
+                    metadata.volumes_created_for_launch.clear();
                     metadata.update_timeout(launch_timeout);
                 },
             )
@@ -2657,6 +2745,12 @@ where
             return;
         }
 
+        if let LaunchPlan::Create(create) = plan {
+            create
+                .runtime_stopped
+                .store(stop_result.is_ok(), Ordering::Release);
+        }
+
         if stop_result.is_err() {
             self.sandboxes
                 .write()
@@ -2685,7 +2779,10 @@ where
                 .await;
         }
         match plan {
-            LaunchPlan::Create(_) => {
+            LaunchPlan::Create(create) => {
+                create
+                    .runtime_stopped
+                    .store(runtime_stopped, Ordering::Release);
                 if !runtime_stopped {
                     let existing = match self.store.get(&plan.sandbox_id()).await {
                         Ok(existing) => existing,

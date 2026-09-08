@@ -57,6 +57,10 @@ pub struct SandboxMetadata {
     /// Independently managed volume mounts keyed by guest path.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub volume_mounts: HashMap<String, String>,
+    /// Volumes restored solely for this create attempt. Cleared on successful
+    /// launch; retained in cleanup debt so failed creates can delete them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes_created_for_launch: Vec<String>,
     /// Whether envd requires the access token derived from this sandbox's ID.
     /// Older records deserialize as non-secure sandboxes.
     #[serde(default)]
@@ -100,6 +104,7 @@ impl Default for SandboxMetadata {
             volume_mounts: HashMap::new(),
             secure: false,
             runtime_stopped: false,
+            volumes_created_for_launch: Vec::new(),
             paused_state: None,
         }
     }

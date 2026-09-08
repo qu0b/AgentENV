@@ -51,6 +51,38 @@ as cache. Recovery must identify and stop the original runtime and resolve its
 owned resources before recording completion. Node loss, partial storage loss,
 and cross-node failover still require qualification and further implementation.
 
+## Volume ownership during create
+
+Warm and cold API creates assign their final sandbox ID before reserving volume
+mounts. There is no post-launch transfer from a temporary owner. On failure,
+the owned create attempt returns explicit evidence of whether its backend
+never started or confirmed stop. The API does not infer that evidence from an
+error status, a later inventory read, or a missing in-memory handle. A lost
+operation result carries no stop confirmation.
+
+An unconfirmed failed create retains its volume reservations under the original
+sandbox ID. The native cleanup record and volume catalog therefore agree on
+who may finish deletion. Confirmed failed creates publish their volume backings
+before releasing reservations. A publication or release failure retains the
+remaining cleanup debt; the API reports the create failure and logs the cleanup
+failure.
+
+Volumes restored solely for a new create are listed in the internal persisted
+`volumes_created_for_launch` field. Successful launch clears that list: those
+volumes then belong to the created sandbox/user and survive ordinary deletion.
+Failed launch retains the list so native deletion can remove those restored
+volumes after stop and release. If a later artifact cleanup fails, retry permits
+absence only for those explicitly recorded volumes; missing existing volumes
+remain an error. Another live volume owner still prevents deletion.
+
+This changes the private metadata contract without changing the public create
+API. Drain old API/control-plane listeners and reconcile legacy `pending-*`
+volume owners before cutover. Do not infer their original VM from current
+inventory. Older records default to an empty launch-owned list; do not backfill
+that list by guessing which volumes were restored. Rollback must preserve this
+cleanup intent as well as the stop/deletion contract. Earlier binaries can
+ignore the list and lose the intent when they remove a cleanup record.
+
 ## Cutover and rollback
 
 This fork is based on AgentENV 0.2.0. Qualification of an earlier native 0.1.3
@@ -85,8 +117,17 @@ state in a fresh orchestrator, verifies retained evidence, repairs only the test
 directory permissions, and retries deletion. Its VM is mocked. Native KVM/ublk,
 volume, broker, and approval restart acceptance remain separate required gates.
 
-The API's create-failure/finalization paths still release pending volume owners
-and may delete restored volumes after an orchestrator error without requiring
-confirmed runtime deletion (`src/api/impls/sandbox.rs`). They need their own
-durable ownership correction and failure tests before mounted-volume recovery
-can be qualified. The orchestrator tests here do not cover that API boundary.
+The create-volume test uses the production API reservation/cleanup helpers,
+real POSIX volume storage and RocksDB sandbox records, with a mock VM backend.
+It covers 24 scenarios across exclusive/read-only volumes, existing/restored
+volumes, success and build/start/readiness failures. A second read-only owner
+survives cleanup of the failed attempt. After a real artifact-permission
+failure, it drops the original orchestrator and opens the same state in a fresh
+one; cleanup finishes even though an owned restored volume was already deleted.
+Removing the stop-proof guard reproduces premature reservation release.
+
+Native disk contents, VM/ublk stop, pre-launch preparation recovery, and crashes
+while publishing/releasing volumes still require acceptance and reconciliation
+work. Snapshot-volume creation precedes mount reservation; a process loss in
+that preparation window is not covered by the new cleanup record. These local
+tests do not qualify mounted-volume recovery on the deployment host.

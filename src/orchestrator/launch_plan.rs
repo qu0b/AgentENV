@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{atomic::AtomicBool, Arc};
 
 use super::store::{NewTimeout, SandboxMetadata};
 use super::types::SandboxState;
@@ -14,6 +14,7 @@ pub(super) struct CreateLaunchPlan {
     pub launch_config: SandboxLaunchConfig,
     pub metadata: SandboxMetadata,
     pub timeout: NewTimeout,
+    pub runtime_stopped: Arc<AtomicBool>,
 }
 
 pub(super) enum CreateLaunchSource {
@@ -45,6 +46,7 @@ impl LaunchPlan {
         launch_config: SandboxLaunchConfig,
         metadata: SandboxMetadata,
         timeout: NewTimeout,
+        runtime_stopped: Arc<AtomicBool>,
     ) -> Self {
         Self::Create(Box::new(CreateLaunchPlan {
             sandbox_id,
@@ -52,6 +54,7 @@ impl LaunchPlan {
             launch_config,
             metadata,
             timeout,
+            runtime_stopped,
         }))
     }
 
@@ -61,6 +64,7 @@ impl LaunchPlan {
         launch_config: SandboxLaunchConfig,
         metadata: SandboxMetadata,
         timeout: NewTimeout,
+        runtime_stopped: Arc<AtomicBool>,
     ) -> Self {
         Self::Create(Box::new(CreateLaunchPlan {
             sandbox_id,
@@ -70,6 +74,7 @@ impl LaunchPlan {
             launch_config,
             metadata,
             timeout,
+            runtime_stopped,
         }))
     }
 
