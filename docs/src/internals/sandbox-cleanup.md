@@ -81,6 +81,46 @@ guessing; preserve and reconcile them using original allocation evidence.
 Rollback must retain this barrier and initial ownership as well as the previous
 stop/deletion and restored-volume cleanup contracts.
 
+## Volume deletion and its local state
+
+Deleting a volume first claims its unmounted catalog record under a durable
+local cleanup identity. The claim sets `deleting=true`, `status=failed` and the
+private `deleteOwner` UUID. Reservation and ordinary catalog updates cannot
+reopen or overwrite this claim. The manager then removes its local backing
+directory and syncs its parent before finishing catalog deletion. A removal
+failure propagates and retains the record for retry by its original ID. A fresh
+manager on the same private state can retry; different local state cannot finish
+an existing claim even if it has no local files for that volume.
+
+`volumes/cleanup-owner.db` stores the version-1 cleanup identity with synchronous
+RocksDB writes. Preserve it together with `volumes/data`, sandbox records and
+allocation state. Opening missing identity state creates a new identity, which
+cannot adopt an old deletion claim. Legacy deleting records without an owner
+require explicit reconciliation. Never copy this identity to another active
+node to bypass that requirement. Drain old catalog writers before cutover;
+rollback must preserve the claim protocol and this identity, in addition to the
+preceding sandbox/volume ownership contracts. The public API is unchanged.
+
+POSIX uses the catalog record lock to claim deletion and holds alias/record
+locks during final cleanup. Alias failures retain the record. OSS uses ETag
+conditional writes to claim deletion and retain ownership across retries. OSS
+keeps the deleted volume's name pointer until a later create reclaims it with
+an ETag conditional write; lookup returns no volume while its record is absent.
+It does not issue an unconditional alias DELETE, which could erase a replacement
+created concurrently. A name is not reclaimable while its old record is still
+present, including pending deletion. Volume IDs are unique lifetime identities
+and must never be reused. The pinned OpenDAL 0.55 S3 client requires
+`if_not_exists(true)` for create-if-absent writes; `if_none_match("*")` is rejected
+by its capability checks before any request. The conditional-write helper now
+uses the supported operation.
+
+This protects cleanup in the local state that began deletion. It does not prove
+that every historical cache copy on every node has been erased, nor establish
+which node must initiate deletion when backing placement is uncertain. Complete
+placement/cache reconciliation, interrupted materialization/publication and
+native mounted-volume cleanup remain required work. Do not treat a missing
+catalog record as a fleet-wide physical erasure receipt.
+
 ## Volume ownership during create
 
 Warm and cold API creates assign their final sandbox ID before reserving volume
@@ -169,7 +209,22 @@ preservation of another read-only owner during cleanup.
 Native disk contents, VM/ublk stop, complete preparation phase recovery, and
 crashes while publishing/releasing volumes still require acceptance and
 reconciliation work. These local tests do not qualify mounted-volume recovery
-on the deployment host. A separate observed gap remains in `VolumeManager::delete`:
-it removes the catalog record before local backing-directory cleanup and logs
-rather than propagates a filesystem removal failure. Durable volume deletion
-must retain cleanup evidence before that behavior can be qualified.
+on the deployment host.
+
+The deletion process test creates real local files, forces a directory-permission
+failure, asserts the failed DELETE retained its claim, then SIGKILLs the child.
+A fresh manager on the original POSIX catalog and private state rejects mounts,
+materialization and completion from another local state, then finishes after
+repairing the fixture permissions. Both exclusive/read-only modes are covered.
+Catalog tests cover a mount winning before the deletion claim, missing/foreign/
+legacy claims, and alias failure before final removal. An HTTP storage fixture
+exercises the actual OpenDAL S3 client through creation, claimed deletion,
+reservation rejection and name reuse; a delayed old delete preserves the new
+name binding. It is a protocol fixture, not live object-storage qualification.
+
+Restoring the preceding manager's catalog-first deletion and swallowed filesystem
+error (adapted only to the new two-phase repository API) makes the process test
+fail at its false-success assertion. Restoring the unsupported S3 write option
+fails the HTTP test at OpenDAL's capability check. The fixed revision passes
+226 relevant Rust tests; no provider call or native VM is involved in these new
+checks.

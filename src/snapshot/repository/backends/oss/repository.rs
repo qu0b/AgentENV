@@ -720,69 +720,48 @@ impl SnapshotRepository for OssSnapshotRepository {
         .await
     }
 
-    async fn delete_volume(&self, volume_id: &str) -> RepositoryResult<()> {
+    async fn begin_volume_deletion(
+        &self,
+        volume_id: &str,
+        owner: uuid::Uuid,
+    ) -> RepositoryResult<()> {
         validate_volume_id(volume_id)?;
-        let mut deleted_record = None;
         for _attempt in 0..MAX_VOLUME_CAS_ATTEMPTS {
             let Some((mut record, etag)) = self.read_volume_record_versioned(volume_id).await?
             else {
                 return Ok(());
             };
-            if let Some(owner) = record.reserved_by_sandbox_id.as_deref() {
-                return Err(RepositoryError::InvalidRequest {
-                    reason: format!("volume '{volume_id}' is reserved by sandbox '{owner}'"),
-                });
+            record
+                .claim_deletion(owner)
+                .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
+            if self
+                .write_volume_record_conditionally(&record, etag.as_deref())
+                .await?
+            {
+                return Ok(());
             }
-            if let Some(owner) = record.read_only_mounts.first() {
-                return Err(RepositoryError::InvalidRequest {
-                    reason: format!(
-                        "volume '{volume_id}' is mounted read-only by sandbox '{owner}'"
-                    ),
-                });
-            }
-            if !record.deleting {
-                record.deleting = true;
-                record.status = VolumeStatus::Failed;
-                if !self
-                    .write_volume_record_conditionally(&record, etag.as_deref())
-                    .await?
-                {
-                    continue;
-                }
-            }
-            deleted_record = Some(record);
-            break;
         }
-        let record = deleted_record.ok_or_else(|| RepositoryError::Backend {
-            message: format!("volume '{volume_id}' changed too often while deleting"),
+        Err(RepositoryError::Backend {
+            message: format!("volume '{volume_id}' changed too often while claiming deletion"),
             source: None,
-        })?;
+        })
+    }
+
+    async fn delete_volume(&self, volume_id: &str, owner: uuid::Uuid) -> RepositoryResult<()> {
+        validate_volume_id(volume_id)?;
+        let Some(record) = self.read_volume_record(volume_id).await? else {
+            return Ok(());
+        };
+        record
+            .validate_deletion(owner)
+            .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
+        // Keep the alias as a stale pointer, reclaimed by claim_volume_alias's
+        // conditional write once this record is absent. OpenDAL 0.55 has no
+        // ETag-conditional delete; read-then-delete could erase a replacement alias.
         self.client
             .delete(&OssSnapshotArtifactLayout::volume_record_key(volume_id))
             .await
-            .map_err(|error| RepositoryError::backend("delete volume record", error))?;
-        let alias_key = OssSnapshotArtifactLayout::volume_alias_key(&record.name);
-        let owns_alias = match self.client.get_bytes(&alias_key).await {
-            Ok(bytes) => {
-                serde_json::from_slice::<String>(&bytes)
-                    .map_err(|error| RepositoryError::backend("parse volume alias", error))?
-                    == volume_id
-            }
-            Err(error) if OssClient::is_not_found_error(&error) => false,
-            Err(error) => {
-                return Err(RepositoryError::backend(
-                    "read volume alias before delete",
-                    error,
-                ))
-            }
-        };
-        if owns_alias {
-            self.client
-                .delete(&alias_key)
-                .await
-                .map_err(|error| RepositoryError::backend("delete volume alias", error))?;
-        }
-        Ok(())
+            .map_err(|error| RepositoryError::backend("delete volume record", error))
     }
 
     async fn reserve_volume(
@@ -898,11 +877,7 @@ impl OssSnapshotRepository {
                     if existing_id == volume_id {
                         return Ok(true);
                     }
-                    if self
-                        .read_volume_record(&existing_id)
-                        .await?
-                        .is_some_and(|record| !record.deleting)
-                    {
+                    if self.read_volume_record(&existing_id).await?.is_some() {
                         return Ok(false);
                     }
                     etag
@@ -1769,6 +1744,156 @@ mod tests {
         )
         .expect("oss client");
         OssSnapshotRepository::new(Arc::new(client), SnapshotImageStoragePolicy::ObjectStorage)
+    }
+
+    #[tokio::test]
+    async fn volume_deletion_claim_and_alias_reuse_over_s3_http() -> anyhow::Result<()> {
+        use axum::{
+            body::{Body, Bytes},
+            extract::State,
+            http::{HeaderMap, Method, StatusCode, Uri},
+            response::{IntoResponse, Response},
+            Router,
+        };
+        use std::collections::HashMap;
+        use tokio::sync::Mutex;
+        type Objects = Arc<Mutex<HashMap<String, (Bytes, String)>>>;
+        async fn storage(
+            State(objects): State<Objects>,
+            method: Method,
+            uri: Uri,
+            headers: HeaderMap,
+            bytes: Bytes,
+        ) -> Response {
+            let mut objects = objects.lock().await;
+            let key = uri.path().to_owned();
+            let current = objects.get(&key);
+            if let Some(expected) = headers.get("if-match") {
+                if current.map(|(_, etag)| etag.as_bytes()) != Some(expected.as_bytes()) {
+                    return StatusCode::PRECONDITION_FAILED.into_response();
+                }
+            }
+            if headers.contains_key("if-none-match") && current.is_some() {
+                return StatusCode::PRECONDITION_FAILED.into_response();
+            }
+            match method {
+                Method::PUT => {
+                    let etag = format!("\"{}\"", uuid::Uuid::now_v7());
+                    objects.insert(key, (bytes, etag.clone()));
+                    Response::builder()
+                        .status(200)
+                        .header("etag", etag)
+                        .body(Body::empty())
+                        .unwrap()
+                }
+                Method::GET | Method::HEAD => match current {
+                    Some((bytes, etag)) => Response::builder()
+                        .status(200)
+                        .header("etag", etag)
+                        .header("content-length", bytes.len())
+                        .body(if method == Method::HEAD {
+                            Body::empty()
+                        } else {
+                            Body::from(bytes.clone())
+                        })
+                        .unwrap(),
+                    None => StatusCode::NOT_FOUND.into_response(),
+                },
+                Method::DELETE => {
+                    assert!(
+                        !key.contains("/aliases/"),
+                        "unconditional alias delete can erase a concurrent replacement"
+                    );
+                    objects.remove(&key);
+                    StatusCode::NO_CONTENT.into_response()
+                }
+                _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+            }
+        }
+        let objects: Objects = Arc::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let app = Router::new().fallback(storage).with_state(objects.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        // Abort the fixture server on either success or assertion failure.
+        struct ServerGuard(tokio::task::JoinHandle<std::io::Result<()>>);
+        impl Drop for ServerGuard {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _server_guard = ServerGuard(server);
+        let repository = OssSnapshotRepository::new(
+            Arc::new(OssClient::new(
+                "bucket".into(),
+                endpoint,
+                "region".into(),
+                "prefix".into(),
+                CredentialSource::Static(object_store_operator::ResolvedCredential::new(
+                    "fixture-access".into(),
+                    "fixture-secret".into(),
+                    None,
+                    None,
+                )?),
+                Some(object_store_operator::AddressingStyle::Path),
+            )?),
+            SnapshotImageStoragePolicy::ObjectStorage,
+        );
+        let owner = uuid::Uuid::now_v7();
+        for mode in [VolumeMode::Exclusive, VolumeMode::ReadOnly] {
+            let record = VolumeRecord {
+                id: format!("vol_{}", uuid::Uuid::now_v7()),
+                name: "reusable-name".into(),
+                mode,
+                size_mb: 64,
+                status: VolumeStatus::Ready,
+                reserved_by_sandbox_id: None,
+                backing_image_config: None,
+                backing_layers: Vec::new(),
+                read_only_mounts: Vec::new(),
+                deleting: false,
+                delete_owner: None,
+            };
+            repository.create_volume(record.clone()).await?;
+            assert!(repository.delete_volume(&record.id, owner).await.is_err());
+            repository.begin_volume_deletion(&record.id, owner).await?;
+            assert!(repository
+                .begin_volume_deletion(&record.id, uuid::Uuid::now_v7())
+                .await
+                .is_err());
+            assert!(repository
+                .delete_volume(&record.id, uuid::Uuid::now_v7())
+                .await
+                .is_err());
+            assert!(repository
+                .reserve_volume(&record.id, "new-owner")
+                .await
+                .is_err());
+            assert!(repository
+                .reserve_read_only_volume(&record.id, "new-owner")
+                .await
+                .is_err());
+            let mut replacement = record.clone();
+            replacement.id = format!("vol_{}", uuid::Uuid::now_v7());
+            assert!(matches!(
+                repository.create_volume(replacement.clone()).await,
+                Err(RepositoryError::VolumeNameConflict { .. })
+            ));
+            repository.delete_volume(&record.id, owner).await?;
+            assert!(repository.get_volume(&record.name).await?.is_none());
+            repository.create_volume(replacement.clone()).await?;
+            // A delayed retry of the original delete must preserve the new alias.
+            repository.delete_volume(&record.id, owner).await?;
+            assert_eq!(
+                repository.get_volume(&record.name).await?.unwrap().id,
+                replacement.id
+            );
+            repository
+                .begin_volume_deletion(&replacement.id, owner)
+                .await?;
+            repository.delete_volume(&replacement.id, owner).await?;
+        }
+        Ok(())
     }
 
     #[test]

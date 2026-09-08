@@ -236,8 +236,19 @@ pub trait SnapshotRepository: Send + Sync {
         unsupported("volume backing materialization")
     }
 
-    /// Removes one durable volume record. Missing records are considered success.
-    async fn delete_volume(&self, _volume_id: &str) -> RepositoryResult<()> {
+    /// Durably prevents new mounts and binds cleanup to one private local state.
+    /// Missing records are considered success. Existing foreign/legacy claims fail.
+    async fn begin_volume_deletion(
+        &self,
+        _volume_id: &str,
+        _owner: uuid::Uuid,
+    ) -> RepositoryResult<()> {
+        unsupported("volume catalog")
+    }
+
+    /// Removes an already-claimed record after its owner's local cleanup succeeds.
+    /// Missing records are considered success; volume IDs must never be reused.
+    async fn delete_volume(&self, _volume_id: &str, _owner: uuid::Uuid) -> RepositoryResult<()> {
         unsupported("volume catalog")
     }
 

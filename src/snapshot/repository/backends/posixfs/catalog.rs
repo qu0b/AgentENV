@@ -458,7 +458,32 @@ impl PosixFsCatalogStore {
         self.write_json(&path, &durable_record)
     }
 
-    pub(crate) fn delete_volume(&self, volume_id: &str) -> RepositoryResult<()> {
+    pub(crate) fn begin_volume_deletion(
+        &self,
+        volume_id: &str,
+        owner: uuid::Uuid,
+    ) -> RepositoryResult<()> {
+        self.ensure_volume_id(volume_id)?;
+        let _guard = self.acquire_volume_record_lock(volume_id)?;
+        let Some(mut record) = self.load_volume_by_id_unlocked(volume_id)? else {
+            return Ok(());
+        };
+        record
+            .claim_deletion(owner)
+            .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
+        let path = PosixFsSnapshotArtifactLayout::volume_record_path(&self.root, volume_id);
+        self.write_json(&path, &record)?;
+        self.sync_volume_record_parent(&path)
+    }
+
+    fn sync_volume_record_parent(&self, path: &Path) -> RepositoryResult<()> {
+        let parent = path.parent().expect("volume catalog parent");
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| RepositoryError::backend("sync volume catalog directory", error))
+    }
+
+    pub(crate) fn delete_volume(&self, volume_id: &str, owner: uuid::Uuid) -> RepositoryResult<()> {
         self.ensure_volume_id(volume_id)?;
         let Some(existing) = self.load_volume_by_id_unlocked(volume_id)? else {
             return Ok(());
@@ -468,28 +493,18 @@ impl PosixFsCatalogStore {
             let Some(record) = store.load_volume_by_id_unlocked(volume_id)? else {
                 return Ok(());
             };
-            if let Some(owner) = record.reserved_by_sandbox_id {
-                return Err(RepositoryError::InvalidRequest {
-                    reason: format!("volume '{volume_id}' is reserved by sandbox '{owner}'"),
-                });
-            }
-            if let Some(owner) = record.read_only_mounts.first() {
-                return Err(RepositoryError::InvalidRequest {
-                    reason: format!(
-                        "volume '{volume_id}' is mounted read-only by sandbox '{owner}'"
-                    ),
-                });
-            }
-            store.remove_file_if_exists(&PosixFsSnapshotArtifactLayout::volume_record_path(
-                &store.root,
-                volume_id,
-            ))?;
+            record
+                .validate_deletion(owner)
+                .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
             let alias_path =
                 PosixFsSnapshotArtifactLayout::volume_alias_path(&store.root, &record.name);
             if alias_path.exists() && store.read_json::<String>(&alias_path)? == volume_id {
                 store.remove_file_if_exists(&alias_path)?;
+                store.sync_volume_record_parent(&alias_path)?;
             }
-            Ok(())
+            let path = PosixFsSnapshotArtifactLayout::volume_record_path(&store.root, volume_id);
+            store.remove_file_if_exists(&path)?;
+            store.sync_volume_record_parent(&path)
         })
     }
 
@@ -1364,7 +1379,56 @@ mod tests {
             backing_layers: Vec::new(),
             read_only_mounts: Vec::new(),
             deleting: false,
+            delete_owner: None,
         }
+    }
+
+    #[test]
+    fn volume_deletion_requires_claim_and_retains_record_on_alias_failure() {
+        use super::PosixFsSnapshotArtifactLayout;
+        let root = TempDir::new().unwrap();
+        let store = PosixFsCatalogStore::new(root.path().to_owned());
+        let record = volume_record(1);
+        let owner = uuid::Uuid::now_v7();
+        store.create_volume(&record).unwrap();
+        assert!(store.delete_volume(&record.id, owner).is_err());
+        assert!(store
+            .begin_volume_deletion(&record.id, uuid::Uuid::nil())
+            .is_err());
+        store.begin_volume_deletion(&record.id, owner).unwrap();
+        assert!(store
+            .begin_volume_deletion(&record.id, uuid::Uuid::now_v7())
+            .is_err());
+        assert!(store.reserve_volume(&record.id, "new-owner").is_err());
+        assert!(store
+            .reserve_read_only_volume(&record.id, "new-reader")
+            .is_err());
+        let alias = PosixFsSnapshotArtifactLayout::volume_alias_path(root.path(), &record.name);
+        std::fs::remove_file(&alias).unwrap();
+        std::fs::create_dir(&alias).unwrap();
+        assert!(store.delete_volume(&record.id, owner).is_err());
+        let fresh = PosixFsCatalogStore::new(root.path().to_owned());
+        assert_eq!(
+            fresh.get_volume(&record.id).unwrap().unwrap().delete_owner,
+            Some(owner)
+        );
+        std::fs::remove_dir(&alias).unwrap();
+        fresh.delete_volume(&record.id, owner).unwrap();
+        assert!(fresh.get_volume(&record.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn legacy_volume_deletion_requires_reconciliation() {
+        let root = TempDir::new().unwrap();
+        let store = PosixFsCatalogStore::new(root.path().to_owned());
+        let mut record = volume_record(1);
+        record.deleting = true;
+        record.status = VolumeStatus::Failed;
+        store.create_volume(&record).unwrap();
+        let owner = uuid::Uuid::now_v7();
+        assert!(store.begin_volume_deletion(&record.id, owner).is_err());
+        assert!(store.delete_volume(&record.id, owner).is_err());
+        assert!(store.get_volume(&record.id).unwrap().unwrap().deleting);
     }
 
     #[test]
@@ -1394,7 +1458,17 @@ mod tests {
                     // and before its authoritative reservation operation.
                     record.status = status;
                     record.deleting = deleting;
-                    store.put_volume(&record).unwrap();
+                    // Include a legacy/corrupt deleting record that still carries
+                    // a mount: even same-owner reservation must refuse it.
+                    store
+                        .write_json(
+                            &super::PosixFsSnapshotArtifactLayout::volume_record_path(
+                                root.path(),
+                                &record.id,
+                            ),
+                            &record,
+                        )
+                        .unwrap();
                     let reservation = if mode == VolumeMode::Exclusive {
                         store
                             .reserve_volume(&record.id, "request-owner")

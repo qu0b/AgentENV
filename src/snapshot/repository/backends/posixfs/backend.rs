@@ -381,10 +381,22 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
         .await
     }
 
-    async fn delete_volume(&self, volume_id: &str) -> RepositoryResult<()> {
+    async fn begin_volume_deletion(
+        &self,
+        volume_id: &str,
+        owner: uuid::Uuid,
+    ) -> RepositoryResult<()> {
+        let volume_id = volume_id.to_owned();
+        self.run_catalog("claim volume deletion", move |store| {
+            store.begin_volume_deletion(&volume_id, owner)
+        })
+        .await
+    }
+
+    async fn delete_volume(&self, volume_id: &str, owner: uuid::Uuid) -> RepositoryResult<()> {
         let volume_id = volume_id.to_owned();
         self.run_catalog("delete volume", move |store| {
-            store.delete_volume(&volume_id)
+            store.delete_volume(&volume_id, owner)
         })
         .await
     }

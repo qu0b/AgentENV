@@ -7,9 +7,9 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::process::Command;
 use tokio::sync::RwLock;
-use tracing::warn;
 use uuid::Uuid;
 
+use crate::local_store::{LocalKvStore, LocalStoreDurability};
 use crate::snapshot::repository::{RepositoryError, SnapshotRepository};
 use crate::snapshot::OverlaybdLayerRef;
 use crate::types::SandboxId;
@@ -66,9 +66,45 @@ pub struct VolumeRecord {
     pub read_only_mounts: Vec<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) deleting: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) delete_owner: Option<Uuid>,
 }
 
 impl VolumeRecord {
+    pub(crate) fn claim_deletion(&mut self, owner: Uuid) -> Result<(), String> {
+        if owner.is_nil() {
+            return Err("volume cleanup owner must not be nil".into());
+        }
+        if self.reserved_by_sandbox_id.is_some() || !self.read_only_mounts.is_empty() {
+            return Err(format!("volume '{}' is still mounted", self.id));
+        }
+        if self.deleting && self.delete_owner != Some(owner) {
+            return Err(format!(
+                "volume '{}' requires its original cleanup state",
+                self.id
+            ));
+        }
+        self.deleting = true;
+        self.delete_owner = Some(owner);
+        self.status = VolumeStatus::Failed;
+        Ok(())
+    }
+
+    pub(crate) fn validate_deletion(&self, owner: Uuid) -> Result<(), String> {
+        if !self.deleting
+            || self.delete_owner != Some(owner)
+            || owner.is_nil()
+            || self.reserved_by_sandbox_id.is_some()
+            || !self.read_only_mounts.is_empty()
+        {
+            return Err(format!(
+                "volume '{}' has no matching unmounted deletion claim",
+                self.id
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn mounted_by(&self, owner: &str) -> bool {
         self.reserved_by_sandbox_id.as_deref() == Some(owner)
             || self.read_only_mounts.iter().any(|entry| entry == owner)
@@ -95,6 +131,9 @@ impl VolumeRecord {
     pub(crate) fn validate_catalog_update(&self, next: &Self) -> Result<(), String> {
         if self.deleting {
             return Err(format!("volume '{}' is being deleted", self.id));
+        }
+        if self.deleting != next.deleting || self.delete_owner != next.delete_owner {
+            return Err("volume deletion state is owned by the deletion APIs".into());
         }
         if self.name != next.name || self.mode != next.mode || self.size_mb != next.size_mb {
             return Err("volume identity fields cannot be changed".to_owned());
@@ -164,6 +203,7 @@ pub enum VolumeError {
 pub struct VolumeManager {
     records: Arc<RwLock<HashMap<String, VolumeRecord>>>,
     root: PathBuf,
+    cleanup_owner: Uuid,
     repository: Arc<dyn SnapshotRepository>,
     limits: VolumeLimits,
 }
@@ -184,6 +224,35 @@ impl Default for VolumeLimits {
     }
 }
 
+#[derive(Deserialize, Serialize)]
+struct VolumeCleanupIdentity {
+    version: u32,
+    owner_id: Uuid,
+}
+
+async fn load_cleanup_owner(root: &Path) -> anyhow::Result<Uuid> {
+    // The DB lock serializes initialization. Release it after loading: managers
+    // reopening the same private state must retain the identity, not invent one.
+    let db = LocalKvStore::open(root.join("cleanup-owner.db"), LocalStoreDurability::Sync).await?;
+    let identity: VolumeCleanupIdentity = match db.get(b"format".to_vec()).await? {
+        Some(bytes) => serde_json::from_slice(&bytes)?,
+        None => {
+            let identity = VolumeCleanupIdentity {
+                version: 1,
+                owner_id: Uuid::now_v7(),
+            };
+            db.put(b"format".to_vec(), serde_json::to_vec(&identity)?)
+                .await?;
+            identity
+        }
+    };
+    anyhow::ensure!(
+        identity.version == 1 && !identity.owner_id.is_nil(),
+        "unsupported volume cleanup identity/version"
+    );
+    Ok(identity.owner_id)
+}
+
 impl VolumeManager {
     pub async fn open_with_repository(
         path: impl Into<std::path::PathBuf>,
@@ -202,10 +271,12 @@ impl VolumeManager {
             .parent()
             .ok_or_else(|| anyhow::anyhow!("volume catalog path has no parent"))?
             .to_path_buf();
+        let cleanup_owner = load_cleanup_owner(&root).await?;
         limits.max_mounts = limits.max_mounts.min(MAX_VOLUME_MOUNTS);
         Ok(Self {
             records: Arc::new(RwLock::new(HashMap::new())),
             root,
+            cleanup_owner,
             repository,
             limits,
         })
@@ -259,6 +330,9 @@ impl VolumeManager {
 
     pub async fn materialize_backing(&self, reference: &str) -> Result<VolumeRecord, VolumeError> {
         let mut record = self.get(reference).await?;
+        if record.deleting {
+            return Err(VolumeError::Failed(record.id));
+        }
         if record
             .backing_image_config
             .as_ref()
@@ -370,6 +444,7 @@ impl VolumeManager {
             backing_layers: Vec::new(),
             read_only_mounts: Vec::new(),
             deleting: false,
+            delete_owner: None,
         };
         let create_result = async {
             if reserved_owner.is_none() {
@@ -403,21 +478,36 @@ impl VolumeManager {
             return Err(VolumeError::Reserved(owner.clone()));
         }
         self.repository
-            .delete_volume(&record.id)
+            .begin_volume_deletion(&record.id, self.cleanup_owner)
             .await
             .map_err(repository_error)?;
         let backing_directory = self.data_dir(&record.id);
-        self.records.write().await.remove(&record.id);
         if let Err(error) = tokio::fs::remove_dir_all(&backing_directory).await {
             if error.kind() != std::io::ErrorKind::NotFound {
-                warn!(
-                    volume_id = %record.id,
-                    path = %backing_directory.display(),
-                    %error,
-                    "failed to clean deleted volume's node-local backing"
-                );
+                return Err(VolumeError::Storage(format!(
+                    "remove local backing '{}': {error}",
+                    backing_directory.display()
+                )));
             }
         }
+        // Persist the local directory removal before removing its catalog claim.
+        let parent = backing_directory
+            .parent()
+            .expect("volume data parent")
+            .to_owned();
+        tokio::task::spawn_blocking(move || match std::fs::File::open(parent) {
+            Ok(directory) => directory.sync_all(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        })
+        .await
+        .map_err(|error| VolumeError::Storage(error.to_string()))?
+        .map_err(|error| VolumeError::Storage(format!("sync volume backing removal: {error}")))?;
+        self.repository
+            .delete_volume(&record.id, self.cleanup_owner)
+            .await
+            .map_err(repository_error)?;
+        self.records.write().await.remove(&record.id);
         Ok(())
     }
 
@@ -484,6 +574,7 @@ impl VolumeManager {
                 Vec::new()
             },
             deleting: false,
+            delete_owner: None,
         };
         self.repository
             .create_volume(record.clone())
@@ -840,6 +931,180 @@ mod tests {
         })?;
         VolumeManager::open_with_repository(root.join("volumes/catalog"), backend.repository())
             .await
+    }
+
+    async fn deletion_fixture(
+        manager: &VolumeManager,
+        mode: VolumeMode,
+    ) -> anyhow::Result<super::VolumeRecord> {
+        Ok(manager
+            .create_from_snapshot(
+                "delete-retry".into(),
+                mode,
+                64,
+                vec![OverlaybdLayerRef::Managed(ManagedLayer {
+                    digest: format!("sha256:{}", "a".repeat(64)),
+                    size: 4096,
+                    uuid: None,
+                })],
+                None,
+            )
+            .await?)
+    }
+
+    #[tokio::test]
+    async fn delete_volume_process_worker() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(root) = std::env::var_os("EU919_DELETE_CHILD_ROOT") else {
+            return Ok(());
+        };
+        let root = std::path::PathBuf::from(root);
+        let manager = preparation_manager(&root).await?;
+        let mode = if std::env::var("EU919_DELETE_CHILD_MODE")? == "readonly" {
+            VolumeMode::ReadOnly
+        } else {
+            VolumeMode::Exclusive
+        };
+        let volume = deletion_fixture(&manager, mode).await?;
+        let data = manager.data_dir(&volume.id);
+        std::fs::create_dir_all(&data)?;
+        std::fs::write(data.join("private-upper"), b"must remain tracked")?;
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o500))?;
+        let deletion = manager.delete(&volume.id).await;
+        // Keep the fixture removable even when this assertion exposes a regression.
+        if deletion.is_ok() {
+            std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700))?;
+        }
+        assert!(
+            deletion.is_err(),
+            "delete must not acknowledge failed local cleanup"
+        );
+        let record = manager.get(&volume.id).await?;
+        assert!(record.deleting);
+        assert_eq!(record.delete_owner, Some(manager.cleanup_owner));
+        let marker = serde_json::json!({"volume": volume.id, "owner": manager.cleanup_owner});
+        std::fs::write(root.join("ready.tmp"), serde_json::to_vec(&marker)?)?;
+        std::fs::rename(root.join("ready.tmp"), root.join("ready.json"))?;
+        std::future::pending::<()>().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_volume_deletion_survives_sigkill_and_requires_original_local_state(
+    ) -> anyhow::Result<()> {
+        use std::os::unix::{fs::PermissionsExt, process::ExitStatusExt};
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        for mode in ["exclusive", "readonly"] {
+            let root = tempfile::tempdir()?;
+            let log = std::fs::File::create(root.path().join("child.log"))?;
+            let mut child = Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "volume::tests::delete_volume_process_worker",
+                    "--nocapture",
+                ])
+                .env("EU919_DELETE_CHILD_ROOT", root.path())
+                .env("EU919_DELETE_CHILD_MODE", mode)
+                .stdout(Stdio::from(log.try_clone()?))
+                .stderr(Stdio::from(log))
+                .spawn()?;
+            let boundary = async {
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while !root.path().join("ready.json").exists() {
+                    if let Some(status) = child.try_wait()? {
+                        anyhow::bail!(
+                            "delete child ended before boundary: {status}: {}",
+                            std::fs::read_to_string(root.path().join("child.log"))?
+                        );
+                    }
+                    anyhow::ensure!(
+                        Instant::now() < deadline,
+                        "delete child did not reach boundary"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                anyhow::Ok(())
+            }
+            .await;
+            let killed = child.kill();
+            let status = child.wait()?;
+            boundary?;
+            killed?;
+            assert_eq!(status.signal(), Some(9));
+            let marker: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(root.path().join("ready.json"))?)?;
+            let id = marker["volume"].as_str().unwrap();
+            let fresh = preparation_manager(root.path()).await?;
+            let data = fresh.data_dir(id);
+            // Repair the induced failure before assertions so temp cleanup remains possible.
+            std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700))?;
+            assert_eq!(
+                fresh.cleanup_owner.to_string(),
+                marker["owner"].as_str().unwrap()
+            );
+            assert_eq!(
+                std::fs::read(data.join("private-upper"))?,
+                b"must remain tracked"
+            );
+            assert_eq!(fresh.get("delete-retry").await?.id, id);
+            assert_eq!(fresh.list_page(None, 10).await?.records.len(), 1);
+            assert!(fresh.reserve(id, "new-mount").await.is_err());
+            assert!(fresh.materialize_backing(id).await.is_err());
+            let foreign_root = tempfile::tempdir()?;
+            let foreign = VolumeManager::open_with_repository(
+                foreign_root.path().join("volumes/catalog"),
+                fresh.repository.clone(),
+            )
+            .await?;
+            assert_ne!(foreign.cleanup_owner, fresh.cleanup_owner);
+            assert!(
+                foreign.delete(id).await.is_err(),
+                "another node cannot acknowledge local cleanup"
+            );
+            assert!(fresh
+                .repository
+                .delete_volume(id, foreign.cleanup_owner)
+                .await
+                .is_err());
+            assert!(data.join("private-upper").exists());
+            fresh.delete(id).await?;
+            assert!(!data.exists());
+            assert!(matches!(
+                fresh.get(id).await,
+                Err(super::VolumeError::NotFound(_))
+            ));
+            assert!(matches!(
+                fresh.get("delete-retry").await,
+                Err(super::VolumeError::NotFound(_))
+            ));
+            let replacement = deletion_fixture(&fresh, VolumeMode::Exclusive).await?;
+            assert_ne!(replacement.id, id);
+            fresh.delete(&replacement.id).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deletion_claim_blocks_cleanup_when_a_mount_wins_the_race() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let manager = preparation_manager(root.path()).await?;
+        for mode in [VolumeMode::Exclusive, VolumeMode::ReadOnly] {
+            let record = deletion_fixture(&manager, mode).await?;
+            // A caller may have read an unmounted record before another request mounts it.
+            manager.reserve(&record.id, "live-vm").await?;
+            assert!(manager
+                .repository
+                .begin_volume_deletion(&record.id, manager.cleanup_owner)
+                .await
+                .is_err());
+            assert!(!manager.get(&record.id).await?.deleting);
+            manager
+                .replace_owner_for("live-vm", None, std::slice::from_ref(&record.id))
+                .await?;
+            manager.delete(&record.id).await?;
+        }
+        Ok(())
     }
 
     #[tokio::test]

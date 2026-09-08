@@ -158,6 +158,19 @@ Owned by `src/snapshot/artifact_cache.rs`, `src/snapshot/runtime_support.rs`, an
 
 `LocalArtifactCache` owns pinning, in-flight materialization deduplication, and LRU eviction for files it manages. It does not own the durable snapshot repository.
 
+## Managed Volume Cleanup
+
+Owned by `src/volume.rs` and the configured snapshot repository.
+
+| Artifact | Location | Purpose | Lifecycle |
+| --- | --- | --- | --- |
+| Local cleanup identity | `$AENV_HOME/volumes/cleanup-owner.db` | Synchronous RocksDB version-1 UUID identifying the private volume state | Preserve with its original backing files across restart. Not a cache; never clone across active nodes or discard to adopt another node's deletion. |
+| Local volume backing | `$AENV_HOME/volumes/data/{volume_id}/` | Node-local volume image configuration and backing data | Removed after an unmounted durable deletion claim and before catalog completion. Removal failure retains the claim. Historical copies and interrupted writes require placement/cache reconciliation. |
+| Shared volume record | POSIX repository or OSS prefix `volumes/records/{volume_id}.json` | Logical layers, reservations, readiness and optional `deleteOwner` | Claimed deletion blocks mounts; only its original local state may finish. Preserve legacy ownerless deletion records for reconciliation. |
+
+See [volume deletion and its local state](sandbox-cleanup.md#volume-deletion-and-its-local-state)
+for name reuse, retry, cutover and the limits of local cleanup evidence.
+
 ## Orchestrator Persistence
 
 Owned by `src/orchestrator/persistence/*`.
