@@ -8295,6 +8295,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-log 0.2.0",
+ "uuid",
  "uvm-ublk",
  "warm-pool",
 ]

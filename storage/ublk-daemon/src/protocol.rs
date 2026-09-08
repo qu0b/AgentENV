@@ -16,6 +16,18 @@ const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DaemonRequest {
+    /// New envelopes are deliberately distinct from legacy numeric-ID RPCs:
+    /// an older daemon must reject them before performing a mutation.
+    AcquireOwned {
+        request: Box<DaemonRequest>,
+    },
+    ReleaseOwned {
+        lease: DeviceLease,
+    },
+    UseOwned {
+        lease: DeviceLease,
+        request: Box<DaemonRequest>,
+    },
     /// Create a raw overlaybd ublk device from an already-materialized image
     /// config. This does not create runtime upper files or rewrite image.json.
     /// Sandbox rootfs and extra drives should use
@@ -103,6 +115,10 @@ pub enum AccessMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum DaemonResponse {
+    Owned {
+        lease: DeviceLease,
+        response: Box<DaemonResponse>,
+    },
     DeviceCreated {
         dev_id: u32,
         device_path: PathBuf,
@@ -143,6 +159,12 @@ pub enum DaemonResponse {
     Error {
         message: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceLease {
+    pub dev_id: u32,
+    pub lease_id: String,
 }
 
 // ── Wire helpers ────────────────────────────────────────────────────────────

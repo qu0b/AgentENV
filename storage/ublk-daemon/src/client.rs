@@ -9,7 +9,8 @@ use tokio::time::{Duration, Instant};
 use warm_pool::PoolConfig;
 
 use crate::protocol::{
-    recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, RestackSnapshotStats,
+    recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, DeviceLease,
+    RestackSnapshotStats,
 };
 use overlaybd::config::UpperMode;
 
@@ -47,6 +48,7 @@ pub struct RestackSnapshotTerminalFailure {
 
 #[derive(Debug, Clone)]
 pub struct OverlaybdRuntimeDevice {
+    pub lease: DeviceLease,
     pub dev_id: u32,
     pub device_path: PathBuf,
     pub actual_virtual_size: u64,
@@ -346,16 +348,17 @@ impl UblkDaemonClient {
         &self,
         image_config: &Path,
         global_config: &Path,
-    ) -> Result<(u32, PathBuf)> {
+    ) -> Result<(u32, PathBuf, DeviceLease)> {
         let request = DaemonRequest::CreateOverlaybd {
             image_config: image_config.to_path_buf(),
             global_config: global_config.to_path_buf(),
         };
-        match self.call(request, DEFAULT_TIMEOUT).await? {
+        let (response, lease) = self.acquire_owned(request, DEFAULT_TIMEOUT).await?;
+        match response {
             DaemonResponse::DeviceCreated {
                 dev_id,
                 device_path,
-            } => Ok((dev_id, device_path)),
+            } => Ok((dev_id, device_path, lease)),
             DaemonResponse::TerminalError { message } => {
                 bail!("daemon: create overlaybd failed terminally: {message}")
             }
@@ -404,16 +407,17 @@ impl UblkDaemonClient {
             known_source_virtual_size: request.known_source_virtual_size,
             allow_shrink: request.allow_shrink,
         };
-        match self
-            .call(request, self.inner.runtime_device_timeout)
-            .await?
-        {
+        let (response, lease) = self
+            .acquire_owned(request, self.inner.runtime_device_timeout)
+            .await?;
+        match response {
             DaemonResponse::OverlaybdRuntimeDeviceCreated {
                 dev_id,
                 device_path,
                 actual_virtual_size,
                 runtime_image_config_path,
             } => Ok(OverlaybdRuntimeDevice {
+                lease,
                 dev_id,
                 device_path,
                 actual_virtual_size,
@@ -435,31 +439,22 @@ impl UblkDaemonClient {
     }
 
     /// Delete a ublk device.
-    pub async fn delete(&self, dev_id: u32) -> Result<()> {
-        let request = DaemonRequest::Delete { dev_id };
-        match self.call(request, DEFAULT_TIMEOUT).await? {
-            DaemonResponse::Deleted => Ok(()),
-            DaemonResponse::TerminalError { message } => {
-                bail!("daemon: delete dev_id={dev_id} failed terminally: {message}")
-            }
-            DaemonResponse::Error { message } => {
-                bail!("daemon: delete dev_id={dev_id} failed: {message}")
-            }
-            other => bail!("daemon: unexpected response for delete: {other:?}"),
-        }
+    pub async fn delete(&self, lease: &DeviceLease) -> Result<()> {
+        self.release_overlaybd(lease).await
     }
 
     /// Request a restack-style snapshot of an overlaybd device's upper layer.
     pub async fn restack_snapshot(
         &self,
-        dev_id: u32,
+        lease: &DeviceLease,
         output_layer_path: &Path,
     ) -> Result<RestackSnapshotStats> {
+        let dev_id = lease.dev_id;
         let request = DaemonRequest::RestackSnapshot {
             dev_id,
             output_layer_path: output_layer_path.to_path_buf(),
         };
-        match self.call(request, SNAPSHOT_TIMEOUT).await? {
+        match self.call(DaemonRequest::UseOwned { lease: lease.clone(), request: Box::new(request) }, SNAPSHOT_TIMEOUT).await? {
             DaemonResponse::RestackSnapshotCreated {
                 descriptor,
                 data_stat,
@@ -518,18 +513,19 @@ impl UblkDaemonClient {
         global_config: &Path,
         virtual_size: u64,
         access_mode: AccessMode,
-    ) -> Result<(u32, PathBuf)> {
+    ) -> Result<(u32, PathBuf, DeviceLease)> {
         let request = DaemonRequest::AcquireOverlaybd {
             image_config: image_config.to_path_buf(),
             global_config: global_config.to_path_buf(),
             virtual_size,
             access_mode,
         };
-        match self.call(request, DEFAULT_TIMEOUT).await? {
+        let (response, lease) = self.acquire_owned(request, DEFAULT_TIMEOUT).await?;
+        match response {
             DaemonResponse::DeviceAcquired {
                 dev_id,
                 device_path,
-            } => Ok((dev_id, device_path)),
+            } => Ok((dev_id, device_path, lease)),
             DaemonResponse::TerminalError { message } => {
                 bail!("daemon: acquire overlaybd failed terminally: {message}")
             }
@@ -541,8 +537,11 @@ impl UblkDaemonClient {
     }
 
     /// Release an overlaybd device back to the pool.
-    pub async fn release_overlaybd(&self, dev_id: u32) -> Result<()> {
-        let request = DaemonRequest::ReleaseOverlaybd { dev_id };
+    pub async fn release_overlaybd(&self, lease: &DeviceLease) -> Result<()> {
+        let dev_id = lease.dev_id;
+        let request = DaemonRequest::ReleaseOwned {
+            lease: lease.clone(),
+        };
         match self.call(request, DEFAULT_TIMEOUT).await? {
             DaemonResponse::Released => Ok(()),
             DaemonResponse::TerminalError { message } => {
@@ -558,12 +557,22 @@ impl UblkDaemonClient {
     /// Update the virtual size of a ublk device.
     ///
     /// Requires `UBLK_F_UPDATE_SIZE` capability.
-    pub async fn update_size(&self, dev_id: u32, new_sectors: u64) -> Result<()> {
+    pub async fn update_size(&self, lease: &DeviceLease, new_sectors: u64) -> Result<()> {
+        let dev_id = lease.dev_id;
         let request = DaemonRequest::UpdateSize {
             dev_id,
             new_sectors,
         };
-        match self.call(request, DEFAULT_TIMEOUT).await? {
+        match self
+            .call(
+                DaemonRequest::UseOwned {
+                    lease: lease.clone(),
+                    request: Box::new(request),
+                },
+                DEFAULT_TIMEOUT,
+            )
+            .await?
+        {
             DaemonResponse::SizeUpdated => Ok(()),
             DaemonResponse::TerminalError { message } => {
                 bail!("daemon: update size dev_id={dev_id} failed terminally: {message}")
@@ -572,6 +581,30 @@ impl UblkDaemonClient {
                 bail!("daemon: update size dev_id={dev_id} failed: {message}")
             }
             other => bail!("daemon: unexpected response for update size: {other:?}"),
+        }
+    }
+
+    async fn acquire_owned(
+        &self,
+        request: DaemonRequest,
+        timeout: Duration,
+    ) -> Result<(DaemonResponse, DeviceLease)> {
+        match self.call(DaemonRequest::AcquireOwned { request: Box::new(request) }, timeout).await? {
+            DaemonResponse::Owned { lease, response } => {
+                let dev_id = match response.as_ref() {
+                    DaemonResponse::DeviceCreated { dev_id, .. } | DaemonResponse::DeviceAcquired { dev_id, .. }
+                        | DaemonResponse::OverlaybdRuntimeDeviceCreated { dev_id, .. } => Some(*dev_id),
+                    _ => None,
+                };
+                if dev_id != Some(lease.dev_id) || uuid::Uuid::parse_str(&lease.lease_id).is_err() {
+                    bail!("daemon returned an invalid device acquisition identity");
+                }
+                Ok((*response, lease))
+            }
+            DaemonResponse::InvalidRequest { message } => Err(InvalidRequestError::new(message).into()),
+            DaemonResponse::TerminalError { message } => bail!("daemon: acquisition failed terminally: {message}"),
+            DaemonResponse::Error { message } => bail!("daemon: acquisition failed: {message}"),
+            _ => bail!("daemon returned an unexpected response without an acquisition-owned device; matching daemon required"),
         }
     }
 
@@ -671,10 +704,14 @@ mod tests {
             "expected 'not running' in error: {msg}"
         );
 
-        let err = client.delete(0).await;
+        let lease = DeviceLease {
+            dev_id: 0,
+            lease_id: uuid::Uuid::now_v7().to_string(),
+        };
+        let err = client.delete(&lease).await;
         assert!(err.is_err());
 
-        let err = client.restack_snapshot(0, Path::new("/out")).await;
+        let err = client.restack_snapshot(&lease, Path::new("/out")).await;
         assert!(err.is_err());
     }
 

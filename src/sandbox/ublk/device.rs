@@ -309,7 +309,7 @@ impl UblkDeviceManager {
 
         let mut metric = MetricGuard::operation(UBLK_OPERATION_DURATION, "release");
         let result = client
-            .release_overlaybd(dev_id)
+            .release_overlaybd(&device.lease)
             .await
             .context("release overlaybd device via daemon");
         metric.finish(&result);
@@ -342,13 +342,14 @@ impl UblkDeviceManager {
         };
         metric.finish(&created);
 
-        let (dev_id, device_path) = created?;
+        let (dev_id, device_path, lease) = created?;
 
         debug!(dev_id, path = %device_path.display(), "ublk device ready");
 
         Ok(UblkDevice {
             dev_id,
             device_path,
+            lease,
         })
     }
 
@@ -370,6 +371,7 @@ impl UblkDeviceManager {
             device: UblkDevice {
                 dev_id: created.dev_id,
                 device_path: created.device_path,
+                lease: created.lease,
             },
             image_config_path: created.runtime_image_config_path,
             actual_virtual_size: created.actual_virtual_size,
@@ -383,7 +385,7 @@ impl UblkDeviceManager {
         debug!(dev_id, "deleting ublk device via daemon");
 
         let mut metric = MetricGuard::operation(UBLK_OPERATION_DURATION, "delete");
-        let result = client.delete(dev_id).await;
+        let result = client.delete(&device.lease).await;
         metric.finish(&result);
         if let Err(e) = result {
             warn!(dev_id, error = %e, "ublk daemon delete failed");
@@ -409,7 +411,7 @@ impl UblkDeviceManager {
         );
         let mut metric = MetricGuard::operation(UBLK_OPERATION_DURATION, "restack_snapshot");
         let result = client
-            .restack_snapshot(device.dev_id, output_layer_path)
+            .restack_snapshot(&device.lease, output_layer_path)
             .await;
         metric.finish(&result);
         match result {
@@ -519,11 +521,12 @@ impl UblkDeviceManager {
                 .await
                 .context("acquire shared memory ublk device");
             metric.finish(&acquired);
-            let (dev_id, device_path) = acquired?;
+            let (dev_id, device_path, lease) = acquired?;
 
             UblkDevice {
                 dev_id,
                 device_path,
+                lease,
             }
         } else {
             self.create_raw_overlaybd_device(spec)
@@ -597,6 +600,7 @@ impl Drop for SharedMemDeviceInner {
         let device = UblkDevice {
             dev_id,
             device_path,
+            lease: self.device.lease.clone(),
         };
         let notify = Arc::new(Notify::new());
         UblkDeviceManager::global()
@@ -698,6 +702,7 @@ impl SharedMemDevice {
 pub(crate) struct UblkDevice {
     dev_id: u32,
     device_path: PathBuf,
+    lease: uvm_ublk_daemon::DeviceLease,
 }
 
 impl UblkDevice {

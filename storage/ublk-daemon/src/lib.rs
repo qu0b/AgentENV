@@ -1,4 +1,5 @@
 pub mod client;
+mod leases;
 pub mod protocol;
 pub(crate) mod runtime;
 pub mod server;
@@ -8,7 +9,7 @@ pub use client::{
     RestackSnapshotTerminalFailure, UblkDaemonClient, UblkDaemonSpawnConfig,
 };
 pub use protocol::{
-    AccessMode, DaemonRequest, DaemonResponse, ResizeToolSpec, RestackSnapshotStats,
+    AccessMode, DaemonRequest, DaemonResponse, DeviceLease, ResizeToolSpec, RestackSnapshotStats,
 };
 pub use server::UblkDaemonServer;
 pub use warm_pool::PoolConfig;

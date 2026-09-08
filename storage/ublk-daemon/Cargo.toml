@@ -20,6 +20,7 @@ nix = { version = "0.30.1", features = ["process", "signal", "resource"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.9.11"
+uuid = { version = "1", features = ["v7"] }
 tokio = { version = "1.44.2", features = ["full"] }
 tracing = "0.1.41"
 tracing-log = "0.2.0"

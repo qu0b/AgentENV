@@ -41,12 +41,60 @@ preceding implementation. The fixed process contract does not yet establish the
 full native cleanup contract: `FirecrackerSandbox::stop` still logs and discards
 failed ublk releases, and a failed network-slot cleanup can release its bitmap
 reservation. These require further correction before native failure acceptance.
-Do not add blind device-release retries: the daemon currently accepts a numeric
-device ID without an acquisition identity. An interrupted release can have
-succeeded; a later retry could target a reused device or decrement another
-shared acquisition. Lease-scoped release identity and outcome reconciliation
-must precede such retries. Missing in-memory handles remain insufficient proof
-after process death.
+The daemon now requires an acquisition identity for release and mutation, as
+described below. This establishes the identity boundary for cleanup retries;
+it does not repair the native handle lifecycle or prove cleanup after process
+death. Missing in-memory handles remain insufficient proof.
+
+## Acquisition-owned device operations
+
+Every daemon device acquisition returns a fresh UUID receipt paired with its
+kernel device number. Distinct shared acquisitions receive distinct receipts,
+even when they use the same underlying device. Release, resize and restack
+requests must present that receipt. The daemon stores whether that acquisition
+uses raw deletion or pooled release; clients cannot select a different release
+operation merely by reusing a device number.
+
+A completed release receipt can be replayed without executing another numeric
+device operation. Release marks its receipt unresolved before awaiting its
+effect. Failure or cancellation leaves it unresolved, and another request
+cannot repeat the effect or mutate that acquisition. Resize and restack hold
+the same receipt lock through execution, so release waits for them. Shared
+acquisition and final release also hold a common per-image lock, preventing a
+new reference from entering a device while its zero-refcount removal is pending.
+
+Failed block-cache invalidation prevents a device from returning to the idle
+pool: the daemon attempts deletion instead. Stop, worker-wait timeout and
+deletion failures propagate through raw and pooled release paths, including
+placeholder and pool-capacity fallbacks. Such errors cannot produce a completed
+receipt. This is conservative failure retention, not automatic reconciliation.
+
+This is an internal Unix RPC cutover: `AcquireOwned`, `ReleaseOwned` and
+`UseOwned` are distinct outer request kinds. Older daemons reject these request
+kinds before mutation; new daemons reject unwrapped legacy device operations.
+Replace server/client and daemon together after draining their sandboxes.
+The public HTTP API and persisted record schemas do not change. Do not mix
+versions or roll back with active receipts; retain the preceding state, drain
+and rollback requirements.
+
+The receipts and shared-key locks are currently retained in memory for the
+daemon lifetime. A new daemon rejects old receipts as unknown. Acquire-response
+loss is not reconciled and must not trigger blind reacquisition. Bounded receipt
+retention, durable resource reconciliation, shutdown versus in-flight operations
+and background refill, native shared-memory handle cleanup, network ownership,
+and target-host KVM/ublk failure qualification remain open. A receipt proves
+only this daemon's completed release operation; it is not a fleet-wide cleanup
+or restart recovery guarantee.
+
+Validation exercises the real ownership dispatcher and client over Unix
+sockets: a completed release loses its reply, the device number is reused, and
+replaying the original release leaves the new acquisition usable. Removing the
+completed-receipt replay guard makes that test fail with a second deletion.
+Other cases cover shared acquisition duplicates, mutation/release serialization,
+unknown/cross-device/nested/unwrapped requests, cancelled and failed release,
+legacy/malformed client responses, and real filesystem/ioctl failures. The
+kernel executor is substituted in ownership tests; these do not qualify native
+device failure cleanup or the remaining lifecycle gaps.
 
 ## Delete and restart
 

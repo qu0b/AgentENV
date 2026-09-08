@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use overlaybd::config::{ImageConfig, UpperConfig, UpperMode};
 use overlaybd::helper::prepare_runtime_upper;
@@ -23,6 +22,7 @@ use uvm_ublk::{
     UVMUblkDevBuilder, UVMUblkTarget,
 };
 
+use crate::leases::{DeviceLeases, ReleaseKind};
 use crate::protocol::{
     recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, ResizeToolSpec,
 };
@@ -129,6 +129,7 @@ struct PoolState {
     /// `active_shared` with `iter_mut`, which can deadlock under concurrent
     /// release requests.
     shared_by_dev_id: DashMap<u32, SharedKey>,
+    shared_locks: DashMap<SharedKey, Arc<Mutex<()>>>,
     /// Per-image locks keep restack mutation exclusive with image opens for
     /// the same image config without serializing unrelated sandbox resumes.
     image_locks: DashMap<ImageLockKey, Arc<RwLock<()>>>,
@@ -161,6 +162,7 @@ impl PoolState {
             active_exclusive: DashMap::new(),
             active_shared: DashMap::new(),
             shared_by_dev_id: DashMap::new(),
+            shared_locks: DashMap::new(),
             image_locks: DashMap::new(),
             refill_inflight: AtomicBool::new(false),
             config,
@@ -264,6 +266,7 @@ pub struct UblkDaemonServer {
     /// a time.
     resize_permit: Arc<Mutex<()>>,
     shutdown: Arc<Notify>,
+    leases: Arc<DeviceLeases>,
 }
 
 impl UblkDaemonServer {
@@ -307,6 +310,7 @@ impl UblkDaemonServer {
             image_service_cache: Arc::new(cache),
             default_image_service,
             devices: Arc::new(DashMap::new()),
+            leases: Arc::new(DeviceLeases::default()),
             pool_state: None,
             resize_tool: None,
             resize_global_config,
@@ -390,6 +394,7 @@ impl UblkDaemonServer {
                 accept = listener.accept() => {
                     let (stream, _) = accept.context("accept daemon connection")?;
                     let devices = Arc::clone(&self.devices);
+                    let leases = Arc::clone(&self.leases);
                     let ctrl_ring = self.ctrl_ring.clone();
                     let image_service_cache = Arc::clone(&self.image_service_cache);
                     let pool_state = self.pool_state.as_ref().map(Arc::clone);
@@ -408,6 +413,7 @@ impl UblkDaemonServer {
                             resize_global_config,
                             resize_permit,
                             shutdown,
+                            leases,
                         ).await {
                             tracing::error!(?err, "daemon connection handler failed");
                         }
@@ -439,7 +445,10 @@ impl UblkDaemonServer {
         for dev_id in dev_ids {
             if let Some((_, mut device)) = self.devices.remove(&dev_id) {
                 tracing::info!(dev_id, "stopping device during shutdown");
-                quiesce_managed_device(&mut device).await;
+                if let Err(error) = quiesce_managed_device(&mut device).await {
+                    tracing::warn!(dev_id, ?error, "device shutdown is unresolved");
+                    continue;
+                }
                 // ManagedDevice holds an open fd to the ublk char dev.
                 // Must drop it before delete_dev, or the DEL_DEV ioctl will block.
                 drop(device);
@@ -457,7 +466,11 @@ impl UblkDaemonServer {
                 .collect();
             for dev_id in exclusive_ids {
                 if let Some((_, active)) = pool.active_exclusive.remove(&dev_id) {
-                    stop_overlaybd_device(self.ctrl_ring.clone(), active.dev).await;
+                    if let Err(error) =
+                        stop_overlaybd_device(self.ctrl_ring.clone(), active.dev).await
+                    {
+                        tracing::warn!(?error, "pooled device shutdown is unresolved");
+                    }
                 }
             }
 
@@ -469,13 +482,20 @@ impl UblkDaemonServer {
             for key in shared_keys {
                 if let Some((_, active)) = pool.active_shared.remove(&key) {
                     pool.shared_by_dev_id.remove(&active.dev.dev_id());
-                    stop_overlaybd_device(self.ctrl_ring.clone(), active.dev).await;
+                    if let Err(error) =
+                        stop_overlaybd_device(self.ctrl_ring.clone(), active.dev).await
+                    {
+                        tracing::warn!(?error, "pooled device shutdown is unresolved");
+                    }
                 }
             }
 
             let idle_devices: Vec<PooledDevice> = pool.idle.drain_all();
             for pooled in idle_devices {
-                stop_overlaybd_device(self.ctrl_ring.clone(), pooled.dev).await;
+                if let Err(error) = stop_overlaybd_device(self.ctrl_ring.clone(), pooled.dev).await
+                {
+                    tracing::warn!(?error, "idle device shutdown is unresolved");
+                }
             }
         }
     }
@@ -494,12 +514,160 @@ async fn handle_connection(
     resize_global_config: PathBuf,
     resize_permit: Arc<Mutex<()>>,
     shutdown: Arc<Notify>,
+    leases: Arc<DeviceLeases>,
 ) -> Result<()> {
     let Some(request) = recv_message::<DaemonRequest>(&mut stream).await? else {
         return Ok(());
     };
 
-    let response = match request {
+    let execute = |request| {
+        execute_request(
+            request,
+            Arc::clone(&devices),
+            ctrl_ring.clone(),
+            Arc::clone(&image_service_cache),
+            pool_state.as_ref().map(Arc::clone),
+            resize_tool.clone(),
+            resize_global_config.clone(),
+            Arc::clone(&resize_permit),
+            Arc::clone(&shutdown),
+        )
+    };
+    let response = dispatch_device_request(&leases, request, pool_state.is_some(), execute).await;
+
+    let response = match response {
+        Ok(resp) => resp,
+        Err(err) => {
+            if err
+                .downcast_ref::<RestackSnapshotTerminalFailure>()
+                .is_some()
+            {
+                DaemonResponse::TerminalError {
+                    message: format!("{err:#}"),
+                }
+            } else if err.downcast_ref::<runtime::InvalidRequest>().is_some() {
+                DaemonResponse::InvalidRequest {
+                    message: format!("{err:#}"),
+                }
+            } else {
+                DaemonResponse::Error {
+                    message: format!("{err:#}"),
+                }
+            }
+        }
+    };
+
+    send_message(&mut stream, &response).await?;
+    Ok(())
+}
+
+/// The single ownership gate for device RPCs. The executor only receives validated
+/// numeric operations while their acquisition remains locked.
+async fn dispatch_device_request<F, Fut>(
+    leases: &DeviceLeases,
+    request: DaemonRequest,
+    pool_enabled: bool,
+    execute: F,
+) -> Result<DaemonResponse>
+where
+    F: FnOnce(DaemonRequest) -> Fut,
+    Fut: std::future::Future<Output = Result<DaemonResponse>>,
+{
+    match request {
+        DaemonRequest::AcquireOwned { request } => {
+            let kind = match request.as_ref() {
+                DaemonRequest::CreateOverlaybd { .. } => Some(ReleaseKind::Raw),
+                DaemonRequest::CreateOverlaybdRuntimeDevice { .. } => Some(if pool_enabled {
+                    ReleaseKind::Pooled
+                } else {
+                    ReleaseKind::Raw
+                }),
+                DaemonRequest::AcquireOverlaybd { .. } => Some(ReleaseKind::Pooled),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                match execute(*request).await {
+                    Ok(response) => {
+                        let dev_id = match &response {
+                            DaemonResponse::DeviceCreated { dev_id, .. }
+                            | DaemonResponse::DeviceAcquired { dev_id, .. }
+                            | DaemonResponse::OverlaybdRuntimeDeviceCreated { dev_id, .. } => {
+                                Some(*dev_id)
+                            }
+                            _ => None,
+                        };
+                        match dev_id {
+                            Some(dev_id) => Ok(DaemonResponse::Owned {
+                                lease: leases.register(dev_id, kind),
+                                response: Box::new(response),
+                            }),
+                            None => Err(anyhow::anyhow!("acquire did not return a device")),
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
+            } else {
+                Err(anyhow::anyhow!(
+                    "ownership acquire requires a device creation request"
+                ))
+            }
+        }
+        DaemonRequest::ReleaseOwned { lease } => leases
+            .release(&lease, |kind| async move {
+                let request = match kind {
+                    ReleaseKind::Raw => DaemonRequest::Delete {
+                        dev_id: lease.dev_id,
+                    },
+                    ReleaseKind::Pooled => DaemonRequest::ReleaseOverlaybd {
+                        dev_id: lease.dev_id,
+                    },
+                };
+                match execute(request).await? {
+                    DaemonResponse::Released | DaemonResponse::Deleted => Ok(()),
+                    _ => bail!("unexpected release result"),
+                }
+            })
+            .await
+            .map(|()| DaemonResponse::Released),
+        DaemonRequest::UseOwned { lease, request } => {
+            let dev_id = match request.as_ref() {
+                DaemonRequest::RestackSnapshot { dev_id, .. }
+                | DaemonRequest::UpdateSize { dev_id, .. } => Some(*dev_id),
+                _ => None,
+            };
+            if dev_id == Some(lease.dev_id) {
+                leases.use_active(&lease, || execute(*request)).await
+            } else {
+                Err(anyhow::anyhow!(
+                    "owned mutation does not match its device acquisition"
+                ))
+            }
+        }
+        request @ (DaemonRequest::GetFeatures
+        | DaemonRequest::NotifySandboxReady { .. }
+        | DaemonRequest::Shutdown) => execute(request).await,
+        _ => Err(anyhow::anyhow!(
+            "device operation requires an acquisition ownership envelope"
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_request(
+    request: DaemonRequest,
+    devices: Arc<DashMap<u32, ManagedDevice>>,
+    ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
+    image_service_cache: Arc<ImageServiceCache>,
+    pool_state: Option<Arc<PoolState>>,
+    resize_tool: Option<ResizeToolSpec>,
+    resize_global_config: PathBuf,
+    resize_permit: Arc<Mutex<()>>,
+    shutdown: Arc<Notify>,
+) -> Result<DaemonResponse> {
+    match request {
+        DaemonRequest::AcquireOwned { .. }
+        | DaemonRequest::ReleaseOwned { .. }
+        | DaemonRequest::UseOwned { .. } => bail!("nested ownership envelope"),
         DaemonRequest::CreateOverlaybd {
             image_config,
             global_config,
@@ -587,32 +755,7 @@ async fn handle_connection(
             shutdown.notify_one();
             Ok(DaemonResponse::Ok)
         }
-    };
-
-    let response = match response {
-        Ok(resp) => resp,
-        Err(err) => {
-            if err
-                .downcast_ref::<RestackSnapshotTerminalFailure>()
-                .is_some()
-            {
-                DaemonResponse::TerminalError {
-                    message: format!("{err:#}"),
-                }
-            } else if err.downcast_ref::<runtime::InvalidRequest>().is_some() {
-                DaemonResponse::InvalidRequest {
-                    message: format!("{err:#}"),
-                }
-            } else {
-                DaemonResponse::Error {
-                    message: format!("{err:#}"),
-                }
-            }
-        }
-    };
-
-    send_message(&mut stream, &response).await?;
-    Ok(())
+    }
 }
 
 // ── Request handlers ────────────────────────────────────────────────────────
@@ -823,7 +966,7 @@ async fn handle_delete(
         bail!("device {dev_id} not found");
     };
 
-    quiesce_managed_device(&mut device).await;
+    quiesce_managed_device(&mut device).await?;
 
     // ManagedDevice contains a open fd to the ublk char dev.
     // We need to drop it first, or else, the DEL_DEV command will stuck
@@ -837,25 +980,20 @@ async fn handle_delete(
     Ok(DaemonResponse::Deleted)
 }
 
-async fn quiesce_managed_device(device: &mut ManagedDevice) {
-    quiesce_ublk_device(&mut device.dev).await;
+async fn quiesce_managed_device(device: &mut ManagedDevice) -> Result<()> {
+    quiesce_ublk_device(&mut device.dev).await
 }
 
-async fn quiesce_ublk_device<T: UVMUblkTarget>(dev: &mut UVMUblkDev<T>) {
+async fn quiesce_ublk_device<T: UVMUblkTarget>(dev: &mut UVMUblkDev<T>) -> Result<()> {
     let dev_id = dev.dev_id();
-
-    if let Err(err) = dev.ctrl.stop_dev().await {
-        tracing::warn!(dev_id, ?err, "failed to stop ublk device before delete");
-        return;
-    }
-
-    if let Err(err) = tokio::time::timeout(Duration::from_secs(5), dev.wait_for_bg_tasks()).await {
-        tracing::warn!(
-            dev_id,
-            ?err,
-            "timed out waiting for ublk queue workers to exit after stop_dev"
-        );
-    }
+    dev.ctrl
+        .stop_dev()
+        .await
+        .with_context(|| format!("stop ublk device {dev_id}"))?;
+    tokio::time::timeout(Duration::from_secs(5), dev.wait_for_bg_tasks())
+        .await
+        .with_context(|| format!("wait for ublk device {dev_id} queue workers to exit"))?;
+    Ok(())
 }
 
 async fn cleanup_failed_ublk_start<T: UVMUblkTarget>(
@@ -936,18 +1074,14 @@ async fn cleanup_failed_ublk_start<T: UVMUblkTarget>(
 async fn stop_overlaybd_device(
     ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
     mut dev: UVMUblkDev<OverlaybdTarget>,
-) {
+) -> Result<()> {
     let dev_id = dev.dev_id();
-    tracing::info!(dev_id, "stopping pooled overlaybd device during shutdown");
-    quiesce_ublk_device(&mut dev).await;
+    tracing::info!(dev_id, "stopping pooled overlaybd device");
+    quiesce_ublk_device(&mut dev).await?;
     drop(dev);
-    if let Err(err) = delete_dev(ctrl_ring, dev_id).await {
-        tracing::warn!(
-            dev_id,
-            ?err,
-            "failed to stop pooled overlaybd device during shutdown"
-        );
-    }
+    delete_dev(ctrl_ring, dev_id)
+        .await
+        .with_context(|| format!("delete pooled overlaybd device {dev_id}"))
 }
 
 async fn handle_restack_snapshot(
@@ -1159,6 +1293,8 @@ async fn acquire_shared(
     image: Arc<ImageFile>,
 ) -> Result<DaemonResponse> {
     let key = (image_config.to_path_buf(), global_config.to_path_buf());
+    let lock = Arc::clone(pool.shared_locks.entry(key.clone()).or_default().value());
+    let _shared_guard = lock.lock().await;
 
     // Check if already active.
     if let Some(mut entry) = pool.active_shared.get_mut(&key) {
@@ -1192,38 +1328,18 @@ async fn acquire_shared(
     // needs it to build a same-size placeholder.
     let refill_virtual_size = image.size_bytes();
 
-    match pool.active_shared.entry(key.clone()) {
-        Entry::Occupied(mut entry) => {
-            let active = entry.get_mut();
-            active.refcount += 1;
-            let existing_dev_id = active.dev.dev_id();
-            let existing_path = active.dev.device_path().to_path_buf();
-            let refcount = active.refcount;
-            drop(entry);
-
-            // Do not idle a redundant business-image device.
-            drop(image);
-            stop_overlaybd_device(ctrl_ring, dev).await;
-            tracing::info!(
-                dev_id = existing_dev_id,
-                refcount,
-                "concurrent shared overlaybd acquire reused existing device"
-            );
-            return Ok(DaemonResponse::DeviceAcquired {
-                dev_id: existing_dev_id,
-                device_path: existing_path,
-            });
-        }
-        Entry::Vacant(entry) => {
-            pool.shared_by_dev_id.insert(dev_id, key);
-            entry.insert(ActiveShared {
-                dev,
-                image_config: image_config.to_path_buf(),
-                image,
-                refcount: 1,
-            });
-        }
-    }
+    // Acquisition and final release hold the same per-image lock. A second
+    // acquisition cannot publish another device between the lookup and here.
+    pool.shared_by_dev_id.insert(dev_id, key.clone());
+    pool.active_shared.insert(
+        key,
+        ActiveShared {
+            dev,
+            image_config: image_config.to_path_buf(),
+            image,
+            refcount: 1,
+        },
+    );
 
     if pool.config.startup_prewarm {
         schedule_idle_pool_refill(Arc::clone(&pool), ctrl_ring, refill_virtual_size);
@@ -1253,6 +1369,8 @@ async fn handle_release_overlaybd(
     if let Some(shared_key) = pool.shared_by_dev_id.get(&dev_id) {
         let key = shared_key.clone();
         drop(shared_key);
+        let lock = Arc::clone(pool.shared_locks.entry(key.clone()).or_default().value());
+        let _shared_guard = lock.lock().await;
 
         let mut remove_shared = false;
         if let Some(mut entry) = pool.active_shared.get_mut(&key) {
@@ -1286,7 +1404,7 @@ async fn release_exclusive_device(
     active: ActiveExclusive,
 ) -> Result<DaemonResponse> {
     tracing::info!(dev_id, "releasing exclusive device");
-    idle_released_device(pool, ctrl_ring, dev_id, active.dev, active.image).await;
+    idle_released_device(pool, ctrl_ring, dev_id, active.dev, active.image).await?;
     Ok(DaemonResponse::Released)
 }
 
@@ -1297,7 +1415,7 @@ async fn release_shared_device(
     active: ActiveShared,
 ) -> Result<DaemonResponse> {
     tracing::info!(dev_id, "releasing shared device (refcount reached 0)");
-    idle_released_device(pool, ctrl_ring, dev_id, active.dev, active.image).await;
+    idle_released_device(pool, ctrl_ring, dev_id, active.dev, active.image).await?;
     Ok(DaemonResponse::Released)
 }
 
@@ -1308,9 +1426,16 @@ async fn idle_released_device(
     dev_id: u32,
     dev: UVMUblkDev<OverlaybdTarget>,
     business_image: Arc<ImageFile>,
-) {
-    // Clear page cache before returning to pool.
-    clear_page_cache(&dev.device_path());
+) -> Result<()> {
+    // A device with stale business-image pages must never enter the idle pool.
+    if let Err(error) = clear_page_cache(&dev.device_path()) {
+        tracing::warn!(
+            dev_id,
+            ?error,
+            "cache clear failed; deleting device instead of reusing it"
+        );
+        return stop_overlaybd_device(ctrl_ring, dev).await;
+    }
 
     let virtual_size = business_image.size_bytes();
     let (placeholder_config, placeholder_image) = match pool.placeholder_for(virtual_size).await {
@@ -1322,8 +1447,7 @@ async fn idle_released_device(
                 "failed to build pool placeholder; deleting device instead of idling business image"
             );
             drop(business_image);
-            stop_overlaybd_device(ctrl_ring, dev).await;
-            return;
+            return stop_overlaybd_device(ctrl_ring, dev).await;
         }
     };
 
@@ -1341,21 +1465,21 @@ async fn idle_released_device(
             "failed to swap device to pool placeholder; deleting device instead of idling business image"
         );
         drop(business_image);
-        stop_overlaybd_device(ctrl_ring, dev).await;
-        return;
+        return stop_overlaybd_device(ctrl_ring, dev).await;
     }
 
     drop(business_image);
     let returned_to_pool =
         return_or_stop_idle_device(pool, ctrl_ring.clone(), dev, Arc::clone(&placeholder_image))
-            .await;
+            .await?;
     if !returned_to_pool {
-        return;
+        return Ok(());
     }
     if pool.config.startup_prewarm {
         schedule_idle_pool_refill(Arc::clone(pool), ctrl_ring, virtual_size);
     }
     tracing::info!(dev_id, "device returned to idle pool on placeholder");
+    Ok(())
 }
 
 async fn handle_update_size(
@@ -1415,7 +1539,7 @@ async fn return_or_stop_idle_device(
     ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
     dev: UVMUblkDev<OverlaybdTarget>,
     placeholder_image: Arc<ImageFile>,
-) -> bool {
+) -> Result<bool> {
     let pooled = PooledDevice {
         dev,
         dev_sectors: placeholder_image.num_lbas(),
@@ -1423,10 +1547,10 @@ async fn return_or_stop_idle_device(
     };
 
     if let Err(pooled) = pool.idle.try_push_bounded(pooled) {
-        stop_excess_idle_device(pool, ctrl_ring, pooled).await;
-        return false;
+        stop_excess_idle_device(pool, ctrl_ring, pooled).await?;
+        return Ok(false);
     }
-    true
+    Ok(true)
 }
 
 fn schedule_idle_pool_refill(
@@ -1481,7 +1605,7 @@ async fn refill_idle_pool(
             _placeholder_image: Arc::clone(&placeholder_image),
         };
         if let Err(pooled) = pool.idle.try_push_bounded(pooled) {
-            stop_excess_idle_device(pool, ctrl_ring.clone(), pooled).await;
+            stop_excess_idle_device(pool, ctrl_ring.clone(), pooled).await?;
             break;
         }
     }
@@ -1507,14 +1631,14 @@ async fn stop_excess_idle_device(
     pool: &PoolState,
     ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
     pooled: PooledDevice,
-) {
+) -> Result<()> {
     let dev_id = pooled.dev.dev_id();
     tracing::info!(
         dev_id,
         high_watermark = pool.idle.config().high_watermark,
         "idle overlaybd pool is full; stopping returned device"
     );
-    stop_overlaybd_device(ctrl_ring, pooled.dev).await;
+    stop_overlaybd_device(ctrl_ring, pooled.dev).await
 }
 
 /// Detect ublk features by sending GET_FEATURES through the ublk control ring.
@@ -1597,39 +1721,28 @@ fn update_device_size(
     dev.ctrl.update_size(new_sectors)
 }
 
-/// Best-effort page cache clear for a block device using BLKFLSBUF ioctl.
-fn clear_page_cache(device_path: &Path) {
+/// Invalidate business-image block pages before the device can be reused.
+fn clear_page_cache(device_path: &Path) -> Result<()> {
     use std::fs::OpenOptions;
     use std::os::unix::fs::OpenOptionsExt;
 
-    // BLKFLSBUF ioctl number: flush buffer cache
-    // Linux asm-generic/ioctl.h encodes _IO(0x12, 97) as (0x12 << 8) | 97.
-    // libc models ioctl's request argument differently across Linux libc
-    // implementations (c_ulong on glibc, c_int on musl). Keep the request
-    // value libc-agnostic and infer the ABI-specific type at the call site.
+    // Linux _IO(0x12, 97); infer the ABI-specific ioctl argument type.
     const BLKFLSBUF: u32 = 0x1261;
-
-    let file = match OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(device_path)
-    {
-        Ok(file) => file,
-        Err(err) => {
-            tracing::warn!(?err, path = %device_path.display(), "failed to open device for cache clear");
-            return;
-        }
-    };
-
-    let fd = file.as_raw_fd();
-    let ret = unsafe { libc::ioctl(fd, BLKFLSBUF as _) };
+        .with_context(|| format!("open device for cache clear: {}", device_path.display()))?;
+    let ret = unsafe { libc::ioctl(file.as_raw_fd(), BLKFLSBUF as _) };
     if ret < 0 {
-        let err = std::io::Error::last_os_error();
-        tracing::warn!(?err, path = %device_path.display(), "failed to clear page cache");
-    } else {
-        tracing::debug!(path = %device_path.display(), "cleared page cache");
+        return Err(std::io::Error::last_os_error()).context("clear device page cache");
     }
+    Ok(())
 }
+
+#[cfg(test)]
+#[path = "owned_request_tests.rs"]
+mod owned_request_tests;
 
 #[cfg(test)]
 mod tests {

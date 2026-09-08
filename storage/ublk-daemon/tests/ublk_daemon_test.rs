@@ -15,8 +15,8 @@ use tokio::sync::oneshot;
 
 use uvm_ublk_daemon::protocol::{recv_message, send_message, DaemonRequest, DaemonResponse};
 use uvm_ublk_daemon::{
-    CreateOverlaybdRuntimeDeviceRequest, InvalidRequestError, RestackSnapshotTerminalFailure,
-    UblkDaemonClient,
+    CreateOverlaybdRuntimeDeviceRequest, DeviceLease, InvalidRequestError,
+    RestackSnapshotTerminalFailure, UblkDaemonClient,
 };
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -24,6 +24,13 @@ use uvm_ublk_daemon::{
 // ════════════════════════════════════════════════════════════════════════════
 
 /// A handler function that takes a request and returns a response.
+fn test_lease(dev_id: u32) -> DeviceLease {
+    DeviceLease {
+        dev_id,
+        lease_id: uuid::Uuid::now_v7().to_string(),
+    }
+}
+
 type MockHandler = Box<dyn Fn(DaemonRequest) -> DaemonResponse + Send + Sync>;
 
 /// A lightweight mock server that listens on a Unix socket and dispatches
@@ -37,7 +44,37 @@ struct MockServer {
 impl MockServer {
     /// Start a mock server with the given handler. Returns immediately;
     /// the server runs in a background task.
+    // Transport/response-mapping fixtures. Ownership state-machine tests use
+    // the production dispatcher in server.rs; this adapter is intentionally
+    // stateless so fixtures can inject malformed and error responses.
     async fn start(handler: MockHandler) -> Self {
+        Self::start_wire(Box::new(move |request| match request {
+            DaemonRequest::AcquireOwned { request } => {
+                let response = handler(*request);
+                let dev_id = match &response {
+                    DaemonResponse::DeviceCreated { dev_id, .. }
+                    | DaemonResponse::DeviceAcquired { dev_id, .. }
+                    | DaemonResponse::OverlaybdRuntimeDeviceCreated { dev_id, .. } => Some(*dev_id),
+                    _ => None,
+                };
+                match dev_id {
+                    Some(dev_id) => DaemonResponse::Owned {
+                        lease: test_lease(dev_id),
+                        response: Box::new(response),
+                    },
+                    None => response,
+                }
+            }
+            DaemonRequest::UseOwned { request, .. } => handler(*request),
+            DaemonRequest::ReleaseOwned { lease } => handler(DaemonRequest::ReleaseOverlaybd {
+                dev_id: lease.dev_id,
+            }),
+            request => handler(request),
+        }))
+        .await
+    }
+
+    async fn start_wire(handler: MockHandler) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("daemon.sock");
 
@@ -274,6 +311,52 @@ mod protocol_tests {
 mod client_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn refuses_legacy_acquisition_response_without_ownership() {
+        let server = MockServer::start_wire(Box::new(|request| {
+            assert!(matches!(request, DaemonRequest::AcquireOwned { .. }));
+            DaemonResponse::DeviceCreated {
+                dev_id: 5,
+                device_path: "/dev/ublkb5".into(),
+            }
+        }))
+        .await;
+        let error = server
+            .client()
+            .create_overlaybd(Path::new("/img"), Path::new("/global"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("matching daemon required"));
+    }
+
+    #[tokio::test]
+    async fn refuses_malformed_or_mismatched_acquisition_identity() {
+        for lease in [
+            DeviceLease {
+                dev_id: 5,
+                lease_id: "invalid".into(),
+            },
+            test_lease(6),
+        ] {
+            let server = MockServer::start_wire(Box::new(move |_| DaemonResponse::Owned {
+                lease: lease.clone(),
+                response: Box::new(DaemonResponse::DeviceCreated {
+                    dev_id: 5,
+                    device_path: "/dev/ublkb5".into(),
+                }),
+            }))
+            .await;
+            let error = server
+                .client()
+                .create_overlaybd(Path::new("/img"), Path::new("/global"))
+                .await
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("invalid device acquisition identity"));
+        }
+    }
+
     // ── create_overlaybd ────────────────────────────────────────────────
 
     #[tokio::test]
@@ -290,11 +373,12 @@ mod client_tests {
         .await;
 
         let client = server.client();
-        let (dev_id, path) = client
+        let (dev_id, path, lease) = client
             .create_overlaybd(Path::new("/tmp/image.json"), Path::new("/global.json"))
             .await
             .unwrap();
         assert_eq!(dev_id, 5);
+        assert_eq!(lease.dev_id, dev_id);
         assert_eq!(path, PathBuf::from("/dev/ublkb5"));
     }
 
@@ -468,7 +552,7 @@ mod client_tests {
     #[tokio::test]
     async fn delete_success() {
         let server = MockServer::start(Box::new(|req| match req {
-            DaemonRequest::Delete { .. } => DaemonResponse::Deleted,
+            DaemonRequest::ReleaseOverlaybd { .. } => DaemonResponse::Released,
             _ => DaemonResponse::Error {
                 message: "unexpected".into(),
             },
@@ -476,7 +560,7 @@ mod client_tests {
         .await;
 
         let client = server.client();
-        client.delete(7).await.unwrap();
+        client.delete(&test_lease(7)).await.unwrap();
     }
 
     #[tokio::test]
@@ -487,7 +571,7 @@ mod client_tests {
         .await;
 
         let client = server.client();
-        let err = client.delete(99).await.unwrap_err();
+        let err = client.delete(&test_lease(99)).await.unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("not found"), "error: {msg}");
     }
@@ -501,7 +585,7 @@ mod client_tests {
         .await;
 
         let client = server.client();
-        let err = client.delete(1).await.unwrap_err();
+        let err = client.delete(&test_lease(1)).await.unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("unexpected"), "error: {msg}");
     }
@@ -527,7 +611,7 @@ mod client_tests {
 
         let client = server.client();
         let stats = client
-            .restack_snapshot(2, Path::new("/snapshots/layer0"))
+            .restack_snapshot(&test_lease(2), Path::new("/snapshots/layer0"))
             .await
             .unwrap();
         assert_eq!(
@@ -548,7 +632,7 @@ mod client_tests {
 
         let client = server.client();
         let err = client
-            .restack_snapshot(2, Path::new("/out"))
+            .restack_snapshot(&test_lease(2), Path::new("/out"))
             .await
             .unwrap_err();
         let msg = format!("{err:#}");
@@ -564,7 +648,7 @@ mod client_tests {
 
         let client = server.client();
         let err = client
-            .restack_snapshot(2, Path::new("/out"))
+            .restack_snapshot(&test_lease(2), Path::new("/out"))
             .await
             .unwrap_err();
         assert!(
@@ -580,7 +664,7 @@ mod client_tests {
 
         let client = server.client();
         let err = client
-            .restack_snapshot(1, Path::new("/out"))
+            .restack_snapshot(&test_lease(1), Path::new("/out"))
             .await
             .unwrap_err();
         let msg = format!("{err:#}");
@@ -647,9 +731,10 @@ mod client_tests {
 
         // Use a tokio timeout shorter than the default 30s to verify the client
         // is actually blocked waiting.
-        let result =
-            tokio::time::timeout(Duration::from_millis(500), async { client.delete(0).await })
-                .await;
+        let result = tokio::time::timeout(Duration::from_millis(500), async {
+            client.delete(&test_lease(0)).await
+        })
+        .await;
 
         assert!(
             result.is_err(),
@@ -665,7 +750,7 @@ mod client_tests {
         // Create client with daemon_dead=true.
         let client = UblkDaemonClient::new_for_test(server.socket_path.clone(), true);
 
-        let err = client.delete(0).await.unwrap_err();
+        let err = client.delete(&test_lease(0)).await.unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("not running"), "error: {msg}");
 
@@ -676,7 +761,7 @@ mod client_tests {
         assert!(format!("{err:#}").contains("not running"));
 
         let err = client
-            .restack_snapshot(0, Path::new("/out"))
+            .restack_snapshot(&test_lease(0), Path::new("/out"))
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("not running"));
@@ -699,7 +784,7 @@ mod client_tests {
                     dev_id: 10,
                     device_path: PathBuf::from("/dev/ublkb10"),
                 },
-                DaemonRequest::Delete { .. } => DaemonResponse::Deleted,
+                DaemonRequest::ReleaseOverlaybd { .. } => DaemonResponse::Released,
                 DaemonRequest::RestackSnapshot { .. } => DaemonResponse::RestackSnapshotCreated {
                     descriptor: None,
                     data_stat: None,
@@ -719,9 +804,9 @@ mod client_tests {
                         runtime_image_config_path: PathBuf::from("/work/overlaybd/image.json"),
                     }
                 }
-                DaemonRequest::ReleaseOverlaybd { .. } => DaemonResponse::Released,
                 DaemonRequest::UpdateSize { .. } => DaemonResponse::SizeUpdated,
                 DaemonRequest::NotifySandboxReady { .. } => DaemonResponse::Ok,
+                _ => panic!("fixture adapter received an unhandled request"),
             }
         }))
         .await;
@@ -732,9 +817,9 @@ mod client_tests {
             .create_overlaybd(Path::new("/config/img.json"), Path::new("/global.json"))
             .await
             .unwrap();
-        client.delete(30).await.unwrap();
+        client.delete(&test_lease(30)).await.unwrap();
         client
-            .restack_snapshot(40, Path::new("/snap/output"))
+            .restack_snapshot(&test_lease(40), Path::new("/snap/output"))
             .await
             .unwrap();
         let requests = captured.lock().unwrap();
@@ -745,7 +830,7 @@ mod client_tests {
         assert!(requests[0].contains("global.json"));
         assert!(!requests[0].contains("dev_id"));
 
-        assert!(requests[1].contains("Delete"));
+        assert!(requests[1].contains("ReleaseOverlaybd"));
         assert!(requests[1].contains("30"));
 
         assert!(requests[2].contains("RestackSnapshot"));
@@ -1014,7 +1099,7 @@ mod server_tests {
     }
 
     #[tokio::test]
-    async fn server_handles_delete_nonexistent_device() {
+    async fn server_rejects_delete_without_acquisition_identity() {
         let dir = tempfile::tempdir().unwrap();
         let sock_path = dir.path().join("server.sock");
 
@@ -1042,8 +1127,8 @@ mod server_tests {
         match resp {
             DaemonResponse::Error { message } => {
                 assert!(
-                    message.contains("not found"),
-                    "expected 'not found' in error: {message}"
+                    message.contains("ownership envelope"),
+                    "expected ownership rejection in error: {message}"
                 );
             }
             other => panic!("expected Error response, got: {other:?}"),
@@ -1055,7 +1140,7 @@ mod server_tests {
     }
 
     #[tokio::test]
-    async fn server_handles_snapshot_nonexistent_device() {
+    async fn server_rejects_snapshot_with_unknown_acquisition() {
         let dir = tempfile::tempdir().unwrap();
         let sock_path = dir.path().join("server.sock");
 
@@ -1076,9 +1161,12 @@ mod server_tests {
         let mut stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
         send_message(
             &mut stream,
-            &DaemonRequest::RestackSnapshot {
-                dev_id: 888,
-                output_layer_path: PathBuf::from("/tmp/snap"),
+            &DaemonRequest::UseOwned {
+                lease: test_lease(888),
+                request: Box::new(DaemonRequest::RestackSnapshot {
+                    dev_id: 888,
+                    output_layer_path: PathBuf::from("/tmp/snap"),
+                }),
             },
         )
         .await
@@ -1088,8 +1176,8 @@ mod server_tests {
         match resp {
             DaemonResponse::Error { message } => {
                 assert!(
-                    message.contains("not found"),
-                    "expected 'not found' in error: {message}"
+                    message.contains("unknown device acquisition"),
+                    "expected unknown acquisition in error: {message}"
                 );
             }
             other => panic!("expected Error response, got: {other:?}"),
@@ -1130,7 +1218,7 @@ mod server_tests {
         .await;
 
         let client = server.client();
-        let (dev_id, path) = client
+        let (dev_id, path, lease) = client
             .acquire_overlaybd(
                 Path::new("/tmp/image.json"),
                 Path::new("/global.json"),
@@ -1140,6 +1228,7 @@ mod server_tests {
             .await
             .unwrap();
         assert_eq!(dev_id, 10);
+        assert_eq!(lease.dev_id, dev_id);
         assert_eq!(path, PathBuf::from("/dev/ublkb10"));
     }
 
@@ -1160,7 +1249,7 @@ mod server_tests {
         .await;
 
         let client = server.client();
-        let (dev_id, path) = client
+        let (dev_id, path, lease) = client
             .acquire_overlaybd(
                 Path::new("/tmp/mem.json"),
                 Path::new("/global.json"),
@@ -1170,6 +1259,7 @@ mod server_tests {
             .await
             .unwrap();
         assert_eq!(dev_id, 20);
+        assert_eq!(lease.dev_id, dev_id);
         assert_eq!(path, PathBuf::from("/dev/ublkb20"));
     }
 
@@ -1187,7 +1277,7 @@ mod server_tests {
         .await;
 
         let client = server.client();
-        client.release_overlaybd(15).await.unwrap();
+        client.release_overlaybd(&test_lease(15)).await.unwrap();
     }
 
     #[tokio::test]
@@ -1208,7 +1298,7 @@ mod server_tests {
         .await;
 
         let client = server.client();
-        client.update_size(25, 2048).await.unwrap();
+        client.update_size(&test_lease(25), 2048).await.unwrap();
     }
 
     #[tokio::test]
