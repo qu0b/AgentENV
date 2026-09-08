@@ -1214,16 +1214,20 @@ impl FirecrackerSandbox {
         }
 
         // Cleanup network resources
-        if let Some(slot) = self.network_slot.take() {
+        if let Some(slot) = self.network_slot.as_ref() {
             let idx = slot.idx;
-            NetworkManager::global()
-                .release(slot)
-                .context("Failed to release network slot")?;
+            self.release_network_slot(NetworkManager::global())?;
             debug!(slot = idx, "network slot released");
         }
 
         debug!("firecracker sandbox stopped");
         Ok(())
+    }
+
+    fn release_network_slot(&mut self, manager: &NetworkManager) -> Result<()> {
+        manager
+            .release_retained(&mut self.network_slot)
+            .context("Failed to release network slot")
     }
 
     fn link_rootfs_runtime(

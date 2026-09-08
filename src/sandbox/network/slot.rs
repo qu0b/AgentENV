@@ -61,6 +61,8 @@ pub(crate) struct Slot {
     netns_dir: PathBuf,
     egress_proxy: Arc<EgressProxy>,
     cleanup_armed: bool,
+    /// Once teardown starts, this slot must never reenter the warm pool.
+    cleanup_started: bool,
     /// Whether this namespace's user egress chain currently contains rules.
     /// Warm-pool reuse preserves the namespace, so the next tenant may need to
     /// clear rules left by the previous tenant.
@@ -111,6 +113,7 @@ impl Slot {
             netns_dir,
             egress_proxy,
             cleanup_armed: false,
+            cleanup_started: false,
             user_egress_rules_present: false,
         })
     }
@@ -819,9 +822,9 @@ impl Slot {
     }
 
     /// Cleans up the network resources for this slot.
-    /// This includes deleting the host-side veth interface, removing the network namespace,
-    /// and removing the host-side MASQUERADE rule.
-    /// Idempotent: safe to call multiple times or concurrently.
+    /// Deletes the host-side veth, namespace bind mount and namespace file.
+    /// Repeated calls require this original slot and its retained reservation;
+    /// cleanup failure must never authorize reuse of the index.
     #[tracing::instrument(
         skip(self),
         fields(
@@ -833,12 +836,43 @@ impl Slot {
         )
     )]
     pub(super) fn cleanup(&mut self, force_sync: bool) -> Result<(), NetworkError> {
+        self.cleanup_with(
+            |idx| {
+                if force_sync {
+                    Self::delete_host_veth_interface_sync(idx)
+                } else {
+                    Self::delete_host_veth_interface(idx)
+                }
+            },
+            nix::mount::umount,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn arm_test_cleanup(&mut self) {
+        self.cleanup_armed = true;
+    }
+
+    pub(super) fn can_reuse(&self) -> bool {
+        !self.cleanup_started
+    }
+
+    /// Retain cleanup state through errors and panics in kernel operations.
+    pub(super) fn cleanup_with<D, U>(
+        &mut self,
+        delete_veth: D,
+        mut unmount: U,
+    ) -> Result<(), NetworkError>
+    where
+        D: FnOnce(u32) -> Result<()>,
+        U: FnMut(&std::path::Path) -> Result<(), nix::errno::Errno>,
+    {
+        self.cleanup_started = true;
         // Skip cleanup for slots that never attempted network setup.
         // This avoids touching host networking state for logical-only Slot values.
         if !self.cleanup_armed {
             return Ok(());
         }
-        self.cleanup_armed = false;
 
         // A namespace-local listener pins the namespace. Stop proxy acceptance
         // before removing the veth and unmounting the namespace, including
@@ -846,27 +880,26 @@ impl Slot {
         self.egress_proxy.teardown(self.host_interaction_ip);
 
         // 1. Delete Host Veth Interface (this destroys the pair)
-        let delete_result = if force_sync {
-            Self::delete_host_veth_interface_sync(self.idx)
-        } else {
-            Self::delete_host_veth_interface(self.idx)
-        };
+        let delete_result = delete_veth(self.idx);
         if let Err(e) = delete_result {
-            self.cleanup_armed = true;
             return Err(NetworkError::NamespaceError(e));
         }
 
         // 2. Unmount Netns Bind Mount (may need multiple unmounts if mounted multiple times)
         let netns_path = self.namespace_path();
         let path = netns_path.as_path();
-        if path.exists() {
+        let path_present = match fs::symlink_metadata(path) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(NetworkError::IoError(error)),
+        };
+        if path_present {
             loop {
-                match nix::mount::umount(path) {
+                match unmount(path) {
                     Ok(_) => continue,
                     Err(nix::errno::Errno::EINVAL) => break, // Not mounted anymore
                     Err(nix::errno::Errno::ENOENT) => break, // File removed by another process
                     Err(e) => {
-                        self.cleanup_armed = true;
                         return Err(NetworkError::NamespaceError(anyhow!(
                             "Failed to unmount netns: {}",
                             e
@@ -880,12 +913,12 @@ impl Slot {
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
-                    self.cleanup_armed = true;
                     return Err(NetworkError::IoError(e));
                 }
             }
         }
 
+        self.cleanup_armed = false;
         Ok(())
     }
 

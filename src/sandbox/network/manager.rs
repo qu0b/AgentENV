@@ -1,11 +1,11 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{anyhow, Result};
-#[cfg(test)]
 use index_set::BitSet;
 use index_set::{slot_count, AtomicBitSet, SharedBitSet};
 use ipnetwork::Ipv4Network;
@@ -51,6 +51,13 @@ pub(crate) struct NetworkManager {
 
     /// Warm slots ready for immediate reuse.
     pool: WarmPool<Slot>,
+
+    /// Failed setup and background cleanup retain their original slots here.
+    /// Their allocation bits stay set until cleanup is confirmed.
+    cleanup_pending: Mutex<Vec<Slot>>,
+
+    /// Bind each in-process allocation bit to its original namespace identity.
+    reservations: Mutex<HashMap<u32, String>>,
 
     /// Configured address plan for newly allocated network slots.
     address_plan: NetworkAddressPlan,
@@ -127,6 +134,8 @@ impl NetworkManager {
         let manager = Self {
             allocated: AtomicBitSet::new(),
             pool: WarmPool::new(config.pool),
+            cleanup_pending: Mutex::new(Vec::new()),
+            reservations: Mutex::new(HashMap::new()),
             address_plan: config.address_plan,
             netns_dir: config.netns_dir,
             egress_proxy,
@@ -170,13 +179,17 @@ impl NetworkManager {
 
         match self.allocated.insert(idx as usize) {
             // insert returns true when the bit WAS already set (duplicate)
-            Some(false) => Ok(Slot::new(
-                idx,
-                self.address_plan,
-                self.netns_dir.clone(),
-                Arc::clone(&self.egress_proxy),
-            )
-            .expect("Slot index just validated")),
+            Some(false) => {
+                let slot = Slot::new(
+                    idx,
+                    self.address_plan,
+                    self.netns_dir.clone(),
+                    Arc::clone(&self.egress_proxy),
+                )
+                .expect("Slot index just validated");
+                self.register_slot(&slot)?;
+                Ok(slot)
+            }
             Some(true) => Err(anyhow!("Slot {} already allocated", idx)),
             None => Err(anyhow!("Slot index {} out of range", idx)),
         }
@@ -190,6 +203,55 @@ impl NetworkManager {
             }
         }
         Err(anyhow!("No available test slots"))
+    }
+
+    fn register_slot(&self, slot: &Slot) -> Result<()> {
+        let mut reservations = self
+            .reservations
+            .lock()
+            .expect("network reservations lock poisoned");
+        match reservations.entry(slot.idx) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(slot.namespace_id.clone());
+                Ok(())
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                Err(anyhow!("Slot {} still has an allocation owner", slot.idx))
+            }
+        }
+    }
+
+    fn validate_slot_owner(&self, slot: &Slot) -> Result<()> {
+        anyhow::ensure!(
+            self.allocated.has(slot.idx as usize),
+            "Slot {} not allocated",
+            slot.idx
+        );
+        let reservations = self
+            .reservations
+            .lock()
+            .expect("network reservations lock poisoned");
+        anyhow::ensure!(
+            reservations.get(&slot.idx) == Some(&slot.namespace_id),
+            "Slot {} does not match its allocation owner",
+            slot.idx
+        );
+        Ok(())
+    }
+
+    fn release_slot_reservation(&self, slot: &Slot) -> Result<()> {
+        let mut reservations = self
+            .reservations
+            .lock()
+            .expect("network reservations lock poisoned");
+        anyhow::ensure!(
+            reservations.get(&slot.idx) == Some(&slot.namespace_id),
+            "Slot {} does not match its allocation owner",
+            slot.idx
+        );
+        self.release_slot_bit(slot.idx)?;
+        reservations.remove(&slot.idx);
+        Ok(())
     }
 
     /// Release only the bitmap bit for a slot index.
@@ -210,19 +272,87 @@ impl NetworkManager {
         self.cleanup_slot_and_release_bit_inner(slot, false)
     }
 
-    fn cleanup_slot_and_release_bit_inner(&self, mut slot: Slot, sync_cleanup: bool) -> Result<()> {
-        let idx = slot.idx;
-        let cleanup_result = slot.cleanup(sync_cleanup);
-        let bitset_result = self.release_slot_bit(idx);
-        match (cleanup_result, bitset_result) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(e), Ok(())) => Err(e.into()),
-            (Ok(()), Err(e)) => Err(e),
-            (Err(ce), Err(be)) => {
-                warn!(cleanup_error = %ce, "network slot cleanup failed alongside bitset release error");
-                Err(be)
+    fn cleanup_slot_and_release_bit_inner(&self, slot: Slot, sync_cleanup: bool) -> Result<()> {
+        self.cleanup_owned_with(slot, sync_cleanup, Slot::cleanup)
+    }
+
+    fn cleanup_owned_with<F>(&self, slot: Slot, sync_cleanup: bool, cleanup: F) -> Result<()>
+    where
+        F: FnOnce(&mut Slot, bool) -> Result<(), NetworkError>,
+    {
+        let mut retained = Some(slot);
+        let result = self.release_retained_with(&mut retained, false, sync_cleanup, cleanup);
+        if let Some(slot) = retained {
+            self.cleanup_pending
+                .lock()
+                .expect("network cleanup lock poisoned")
+                .push(slot);
+        }
+        result
+    }
+
+    /// Caller-owned release. Errors preserve the exact Slot and reservation.
+    pub(crate) fn release_retained(&self, slot: &mut Option<Slot>) -> Result<()> {
+        self.release_retained_with(slot, true, false, Slot::cleanup)
+    }
+
+    fn release_retained_with<F>(
+        &self,
+        slot: &mut Option<Slot>,
+        allow_reuse: bool,
+        sync_cleanup: bool,
+        cleanup: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&mut Slot, bool) -> Result<(), NetworkError>,
+    {
+        let Some(current) = slot.as_ref() else {
+            return Ok(());
+        };
+        self.validate_slot_owner(current)?;
+        if allow_reuse && !self.shutting_down() && current.can_reuse() {
+            let owned = slot.take().expect("retained slot");
+            match self.pool.release(owned) {
+                Ok(()) => return Ok(()),
+                Err(owned) => *slot = Some(owned),
             }
         }
+        let current = slot.as_mut().expect("slot not returned to pool");
+        cleanup(current, sync_cleanup)?;
+        self.release_slot_reservation(current)?;
+        *slot = None;
+        Ok(())
+    }
+
+    fn retry_pending_cleanup(&self, sync_cleanup: bool) -> Result<()> {
+        self.retry_pending_cleanup_with(sync_cleanup, Slot::cleanup)
+    }
+
+    fn retry_pending_cleanup_with<F>(&self, sync_cleanup: bool, mut cleanup: F) -> Result<()>
+    where
+        F: FnMut(&mut Slot, bool) -> Result<(), NetworkError>,
+    {
+        // Release the mutex before I/O. Concurrent callers take disjoint owners;
+        // failures return to the queue for a later bounded pass.
+        let pending = std::mem::take(
+            &mut *self
+                .cleanup_pending
+                .lock()
+                .expect("network cleanup lock poisoned"),
+        );
+        let mut errors = Vec::new();
+        for slot in pending {
+            let idx = slot.idx;
+            if let Err(error) = self.cleanup_owned_with(slot, sync_cleanup, &mut cleanup) {
+                errors.push(format!("slot {idx}: {error}"));
+            }
+        }
+        anyhow::ensure!(
+            errors.is_empty(),
+            "network cleanup remains pending: {}",
+            errors.join(" | ")
+        );
+        Ok(())
     }
 
     pub(crate) fn cleanup_allocated_slot(&self, slot: Slot, sync_cleanup: bool) -> Result<()> {
@@ -277,8 +407,11 @@ impl NetworkManager {
                     Arc::clone(&self.egress_proxy),
                 )
                 .expect("BitSet index within valid range");
+                self.register_slot(&slot)?;
                 if let Err(e) = slot.create_network() {
-                    self.allocated.remove(idx);
+                    if let Err(cleanup_error) = self.cleanup_slot_and_release_bit(slot) {
+                        return Err(anyhow!("Failed to create network: {e}; original slot cleanup pending: {cleanup_error}"));
+                    }
                     return Err(anyhow!("Failed to create network: {e}"));
                 }
 
@@ -305,6 +438,22 @@ impl NetworkManager {
     }
 
     fn run_pool_maintenance_cycle(&self) -> Result<()> {
+        let mut errors = Vec::new();
+        if let Err(error) = self.retry_pending_cleanup(false) {
+            errors.push(error.to_string());
+        }
+        if let Err(error) = self.run_pool_maintenance_action() {
+            errors.push(error.to_string());
+        }
+        anyhow::ensure!(
+            errors.is_empty(),
+            "network pool maintenance: {}",
+            errors.join(" | ")
+        );
+        Ok(())
+    }
+
+    fn run_pool_maintenance_action(&self) -> Result<()> {
         let action = self.pool.compute_maintenance_action(self.pool.len());
 
         match action {
@@ -367,21 +516,15 @@ impl NetworkManager {
     /// When pool maintenance is disabled, this keeps the previous bounded-pool
     /// behavior and cleans up immediately once the pool reaches high watermark.
     pub fn release(&self, slot: Slot) -> Result<()> {
-        if self.shutting_down() {
-            return self.cleanup_slot_and_release_bit(slot);
+        let mut retained = Some(slot);
+        let result = self.release_retained(&mut retained);
+        if let Some(slot) = retained {
+            self.cleanup_pending
+                .lock()
+                .expect("network cleanup lock poisoned")
+                .push(slot);
         }
-        let slot_idx = slot.idx;
-        match self.pool.release(slot) {
-            Ok(()) => {
-                debug!(
-                    slot = slot_idx,
-                    pool_len = self.pool.len(),
-                    "returned network slot to pool"
-                );
-                Ok(())
-            }
-            Err(slot) => self.cleanup_slot_and_release_bit(slot),
-        }
+        result
     }
 
     /// Cleans up all warm slots cached in the pool.
@@ -400,6 +543,9 @@ impl NetworkManager {
         let drained_slots = self.pool.drain_all();
         let had_slots = !drained_slots.is_empty();
         let mut failures = Vec::new();
+        if let Err(error) = self.retry_pending_cleanup(sync_cleanup) {
+            failures.push(error.to_string());
+        }
 
         if had_slots {
             debug!(
@@ -736,6 +882,10 @@ fn run_command(command: &str, args: &[&str], capabilities: &'static [i32]) -> Op
 }
 
 #[cfg(test)]
+#[path = "cleanup_tests.rs"]
+mod cleanup_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use index_set::BitSet;
@@ -747,14 +897,16 @@ mod tests {
         NetworkManager::new(false, capacity, capacity)
     }
 
-    fn test_slot(idx: u32) -> Slot {
-        Slot::new(
+    fn test_slot(manager: &NetworkManager, idx: u32) -> Slot {
+        let slot = Slot::new(
             idx,
             NetworkAddressPlan::default(),
             std::env::temp_dir().join("aenv-network-tests/netns"),
             EgressProxy::new(),
         )
-        .unwrap()
+        .unwrap();
+        manager.register_slot(&slot).unwrap();
+        slot
     }
 
     fn command_stdout(command: &str, args: &[&str]) -> Option<String> {
@@ -972,7 +1124,7 @@ mod tests {
         let manager = NetworkManager::new(true, 0, 2);
         for idx in 1..=4u32 {
             manager.allocated.insert(idx as usize);
-            manager.pool.release(test_slot(idx)).unwrap();
+            manager.pool.release(test_slot(&manager, idx)).unwrap();
         }
 
         manager.run_pool_maintenance_cycle().unwrap();
@@ -992,7 +1144,10 @@ mod tests {
         let manager = Arc::new(manager_with_capacity(n));
         for idx in 1..=(n as u32) {
             manager.allocated.insert(idx as usize);
-            manager.pool.try_push_bounded(test_slot(idx)).unwrap();
+            manager
+                .pool
+                .try_push_bounded(test_slot(&manager, idx))
+                .unwrap();
         }
 
         let handles: Vec<_> = (0..n)
@@ -1020,7 +1175,7 @@ mod tests {
         let manager = manager_with_capacity(5);
         // Pre-insert a slot into the bitset (simulating a prior allocation)
         manager.allocated.insert(10);
-        let slot = test_slot(10);
+        let slot = test_slot(&manager, 10);
         // release() should push the slot into the pool (capacity=5, pool is empty)
         manager.release(slot).unwrap();
         let pool_len = manager.pool.len();
@@ -1037,7 +1192,7 @@ mod tests {
         let manager = manager_with_capacity(5);
         // Manually put a slot (idx=42) in the pool and mark it allocated in the bitset
         manager.allocated.insert(42);
-        let pooled = test_slot(42);
+        let pooled = test_slot(&manager, 42);
         manager.pool.try_push_bounded(pooled).unwrap();
 
         // allocate_any() must pop from pool (idx=42) without calling create_network()
@@ -1054,7 +1209,7 @@ mod tests {
         // high_watermark = 0: release() must NOT push to pool, must call cleanup() instead
         let manager = manager_with_capacity(0);
         manager.allocated.insert(7);
-        let slot = test_slot(7);
+        let slot = test_slot(&manager, 7);
         manager.release(slot).unwrap();
         // Pool must be empty (slot was NOT cached)
         assert!(manager.pool.is_empty(), "pool must be empty");
@@ -1069,7 +1224,7 @@ mod tests {
     fn release_enqueues_above_high_watermark_and_drains_async() {
         let manager = NetworkManager::new(true, 0, 0);
         manager.allocated.insert(17);
-        let slot = test_slot(17);
+        let slot = test_slot(&manager, 17);
 
         manager.release(slot).unwrap();
 
@@ -1098,8 +1253,14 @@ mod tests {
         manager.allocated.insert(11);
         manager.allocated.insert(12);
 
-        manager.pool.try_push_bounded(test_slot(11)).unwrap();
-        manager.pool.try_push_bounded(test_slot(12)).unwrap();
+        manager
+            .pool
+            .try_push_bounded(test_slot(&manager, 11))
+            .unwrap();
+        manager
+            .pool
+            .try_push_bounded(test_slot(&manager, 12))
+            .unwrap();
 
         manager.shutdown().unwrap();
 
@@ -1118,7 +1279,10 @@ mod tests {
     fn shutdown_cleanup_is_idempotent() {
         let manager = manager_with_capacity(4);
         manager.allocated.insert(14);
-        manager.pool.try_push_bounded(test_slot(14)).unwrap();
+        manager
+            .pool
+            .try_push_bounded(test_slot(&manager, 14))
+            .unwrap();
 
         manager.shutdown().unwrap();
         manager.shutdown().unwrap();
@@ -1131,7 +1295,10 @@ mod tests {
     fn allocate_any_is_rejected_after_shutdown_cleanup() {
         let manager = manager_with_capacity(4);
         manager.allocated.insert(9);
-        manager.pool.try_push_bounded(test_slot(9)).unwrap();
+        manager
+            .pool
+            .try_push_bounded(test_slot(&manager, 9))
+            .unwrap();
 
         manager.shutdown().unwrap();
 
@@ -1145,7 +1312,7 @@ mod tests {
         manager.shutdown().unwrap();
 
         manager.allocated.insert(13);
-        let slot = test_slot(13);
+        let slot = test_slot(&manager, 13);
         manager.release(slot).unwrap();
 
         assert!(manager.pool.is_empty(), "pool must remain empty");
@@ -1159,7 +1326,7 @@ mod tests {
     fn release_race_with_shutdown_does_not_recache_slot() {
         let manager = Arc::new(manager_with_capacity(4));
         manager.allocated.insert(15);
-        let slot = test_slot(15);
+        let slot = test_slot(&manager, 15);
 
         let release_manager = manager.clone();
         let release_thread = std::thread::spawn(move || {
@@ -1191,7 +1358,7 @@ mod tests {
         for idx in 1u32..=50 {
             manager.allocated.insert(idx as usize);
         }
-        let slot_values: Vec<Slot> = (1u32..=50).map(test_slot).collect();
+        let slot_values: Vec<Slot> = (1u32..=50).map(|idx| test_slot(&manager, idx)).collect();
 
         // Release all 50 slots concurrently — at most 10 should end up in the pool.
         let handles: Vec<_> = slot_values
@@ -1224,63 +1391,50 @@ mod tests {
     #[test]
     fn concurrent_allocate_and_release_cycle() {
         let total = 50;
-        // Pre-populate the pool so allocate_any() uses the fast path (no create_network).
         let manager = Arc::new(manager_with_capacity(total));
-        for idx in 1..=(total as u32) {
-            manager.allocated.insert(idx as usize);
-            manager.pool.try_push_bounded(test_slot(idx)).unwrap();
+        for idx in 1..=total as u32 {
+            let slot = manager.allocate_slot(idx).unwrap();
+            manager.pool.try_push_bounded(slot).unwrap();
         }
-
-        // Phase 1: Allocate 50 slots concurrently from the pool
         let handles: Vec<_> = (0..total)
             .map(|_| {
-                let m = manager.clone();
-                std::thread::spawn(move || {
-                    let slot = m.allocate_any().unwrap();
-                    let idx = slot.idx;
-                    drop(slot);
-                    idx
-                })
+                let manager = Arc::clone(&manager);
+                std::thread::spawn(move || manager.allocate_any().unwrap())
             })
             .collect();
-        let first_batch: Vec<u32> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-
-        // Phase 2: Release even-indexed results concurrently (just freeing the bitset bit)
-        let to_release: Vec<u32> = first_batch.iter().copied().filter(|i| i % 2 == 0).collect();
-        let release_count = to_release.len();
-        let handles: Vec<_> = to_release
+        let first: Vec<Slot> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let indices: HashSet<_> = first.iter().map(|slot| slot.idx).collect();
+        assert_eq!(indices.len(), total);
+        let (released, retained): (Vec<_>, Vec<_>) =
+            first.into_iter().partition(|slot| slot.idx % 2 == 0);
+        let released_indices: Vec<_> = released.iter().map(|slot| slot.idx).collect();
+        let handles: Vec<_> = released
             .into_iter()
-            .map(|idx| {
-                let m = manager.clone();
-                std::thread::spawn(move || m.release_slot_bit(idx).unwrap())
+            .map(|slot| {
+                let manager = Arc::clone(&manager);
+                std::thread::spawn(move || manager.cleanup_allocated_slot(slot, true).unwrap())
             })
             .collect();
-        for h in handles {
-            h.join().unwrap();
+        for handle in handles {
+            handle.join().unwrap();
         }
-
-        // Phase 3: Re-allocate the released slots (slow path — bitset only, no create_network in test)
-        // Re-add them to the pool so the test remains root-free.
-        for idx in first_batch.iter().copied().filter(|i| i % 2 == 0) {
-            manager.allocated.insert(idx as usize); // re-mark as allocated
-            manager.pool.try_push_bounded(test_slot(idx)).unwrap();
+        for idx in &released_indices {
+            let slot = manager.allocate_slot(*idx).unwrap();
+            manager.pool.try_push_bounded(slot).unwrap();
         }
-        let handles: Vec<_> = (0..release_count)
+        let handles: Vec<_> = (0..released_indices.len())
             .map(|_| {
-                let m = manager.clone();
-                std::thread::spawn(move || {
-                    let slot = m.allocate_any().unwrap();
-                    let idx = slot.idx;
-                    drop(slot);
-                    idx
-                })
+                let manager = Arc::clone(&manager);
+                std::thread::spawn(move || manager.allocate_any().unwrap())
             })
             .collect();
-        let second_batch: HashSet<u32> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-
-        // All new allocations must be unique and non-zero
-        assert_eq!(second_batch.len(), release_count);
-        assert!(!second_batch.contains(&0));
+        let second: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let second_indices: HashSet<_> = second.iter().map(|slot| slot.idx).collect();
+        assert_eq!(second_indices, released_indices.into_iter().collect());
+        for slot in retained.into_iter().chain(second) {
+            manager.cleanup_allocated_slot(slot, true).unwrap();
+        }
+        assert!(manager.reservations.lock().unwrap().is_empty());
     }
 
     #[test]

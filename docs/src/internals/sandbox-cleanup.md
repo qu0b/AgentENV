@@ -38,9 +38,9 @@ failure returned success.
 
 Real subprocess and filesystem tests reproduce both failures against the
 preceding implementation. Process confirmation alone does not establish full
-native cleanup: a failed network-slot cleanup can still release its bitmap
-reservation, and interrupted native effects require reconciliation. Device
-receipt identity and native handle retention are described below. Missing
+native cleanup: interrupted native effects and warm-process cleanup still
+require reconciliation. Device and network ownership corrections are described
+below. Missing
 in-memory handles remain insufficient proof after process death.
 
 ## Acquisition-owned device operations
@@ -125,7 +125,7 @@ This native lifecycle cutover requires the acquisition-owned protocol and a
 coordinated, drained server/daemon update. No public HTTP or persisted record
 schema changes are added. Preserve all earlier drain, state and rollback rules.
 Target-host boot, pause/resume, shared-memory capacity and failure cleanup remain
-unqualified for this revision. Network release ownership, daemon shutdown races,
+unqualified for this revision. Kernel network ownership, daemon shutdown races,
 durable/bounded receipt retention and recovery after process loss remain open.
 
 Focused tests drive the production manager/client over Unix sockets and use real
@@ -139,6 +139,53 @@ ownership patterns makes six of the seven focused cases fail. With the fixes,
 85 Firecracker, 3 ublk-manager, 10 extra-drive, 144 orchestrator and 97 daemon
 tests pass (339 distinct cases), along with all-target/all-feature clippy with
 warnings denied and workspace formatting.
+
+## Network slot reservation and cleanup ownership
+
+Native stop retains its original `Slot` across release errors. The manager
+removes that handle only when the intact slot is accepted by the warm pool or
+its cleanup routine succeeds. Once teardown starts, the slot cannot reenter the
+pool, even if capacity becomes available before a retry. Kernel/filesystem
+errors and panics inside slot cleanup keep its cleanup state armed. Metadata
+lookup errors are no longer treated as proof that the namespace path is absent.
+
+Each in-process bitmap reservation is bound to its original namespace UUID.
+Unknown or stale identities cannot authorize cleanup, pool return or reservation
+release merely because their numeric index is allocated. Cleanup completes
+before the bit and identity are removed. A subsequent allocation gets a new
+namespace identity. The slot remains a unique, non-clonable owner throughout
+handoff; retries must retain it rather than reconstruct a descriptor by index.
+
+Failed setup and background pool cleanup hand the original slot to the manager's
+pending queue. Its reservation remains occupied. Maintenance and shutdown retry
+a bounded batch of those retained owners; concurrent retries take disjoint slots.
+Unresolved pending work remains reported, while unrelated pool draining can
+still progress. Caller-owned failed releases stay in the sandbox for its next
+stop attempt. No new persistent state schema or public API change is introduced;
+use the preceding coordinated drain and rollback requirements.
+
+This is an in-process ownership contract. Reservations and pending slots are not
+durable. Kernel veth deletion still identifies the interface by its slot-derived
+name, so interface-incarnation verification and recovery across processes or
+restart remain unqualified. Existing host-interface discovery reserves indices
+but cannot establish cleanup authority for an old namespace. Warm Firecracker
+cleanup still logs stop failures before proceeding with network cleanup; its
+process/resource ownership must be corrected before full native acceptance.
+Daemon shutdown, native recovery and target-host failure qualification remain
+open. Do not infer physical erasure or safe placement after process loss.
+
+Focused tests use real filesystem failures with substituted veth/unmount
+operations; they do not modify host interfaces or mount namespaces. They cover
+retained cleanup and allocation bits, stale namespace identities after index
+reuse, concurrent pending retries, continued independent draining, metadata
+errors, a kernel-operation panic, and the native sandbox's retained slot after a
+release error. Privileged lifecycle and exit-hook tests remain separately gated
+and are not evidence for this change until run in an isolated native environment.
+The targeted run passes 71 network, 86 Firecracker, 3 ublk-manager, 10 extra-drive,
+144 orchestrator and 97 daemon tests (411 distinct cases); two privileged network
+tests are ignored. All-target/all-feature clippy with warnings denied and workspace
+formatting pass. Moving reservation release ahead of cleanup makes four focused
+tests fail; restoring the native pre-release `take()` fails its ownership test.
 
 ## Delete and restart
 

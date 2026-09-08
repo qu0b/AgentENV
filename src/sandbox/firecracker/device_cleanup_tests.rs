@@ -18,6 +18,24 @@ fn sandbox() -> Result<FirecrackerSandbox> {
     ))
 }
 
+#[test]
+fn network_release_error_retains_the_original_sandbox_slot() -> Result<()> {
+    let owner = NetworkManager::new(false, 0, 0);
+    let foreign = NetworkManager::new(false, 0, 0);
+    let mut sandbox = sandbox()?;
+    let slot = owner.allocate_test_slot()?;
+    let original = slot.namespace_id.clone();
+    sandbox.network_slot = Some(slot);
+    assert!(sandbox.release_network_slot(&foreign).is_err());
+    assert_eq!(
+        sandbox.network_slot.as_ref().unwrap().namespace_id,
+        original
+    );
+    sandbox.release_network_slot(&owner)?;
+    assert!(sandbox.network_slot.is_none());
+    Ok(())
+}
+
 #[tokio::test]
 async fn cancelled_release_retains_each_original_device_receipt() -> Result<()> {
     for kind in 0..3 {
