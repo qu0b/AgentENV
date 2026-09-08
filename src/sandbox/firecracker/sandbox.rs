@@ -43,8 +43,8 @@ use crate::sandbox::extra_drive::{
 use crate::sandbox::network::{NetworkManager, SandboxNetworkPolicy, Slot};
 use crate::sandbox::process::Executor;
 use crate::sandbox::ublk::{
-    OverlaybdCompactOutput, OverlaybdConfig, OverlaybdRuntimeHandle, SharedMemDevice, UblkBackend,
-    UblkCreateSpec, UblkDeviceManager,
+    OverlaybdCompactOutput, OverlaybdConfig, OverlaybdRuntimeHandle, UblkBackend, UblkCreateSpec,
+    UblkDevice, UblkDeviceManager,
 };
 use crate::sandbox::SandboxLaunchConfig;
 use crate::snapshot::RunnableSnapshot;
@@ -183,7 +183,7 @@ pub struct FirecrackerSandbox {
     current_custom_extension_params: Option<CustomExtensionParams>,
     envd_instance: Option<EnvdInstance>,
     rootfs_runtime: Option<OverlaybdRuntimeHandle>,
-    mem_ublk_device: Option<SharedMemDevice>,
+    mem_ublk_device: Option<UblkDevice>,
     /// image.json path the memory device was opened with. Used as the device
     /// key to release held background downloads once envd is ready.
     mem_snapshot_image_config_path: Option<PathBuf>,
@@ -731,6 +731,12 @@ impl FirecrackerSandbox {
     /// This only waits for the Firecracker API socket to be available and
     /// returns immediately after VM start command is issued.
     pub(crate) async fn start_nowait(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            self.rootfs_runtime.is_none()
+                && self.mem_ublk_device.is_none()
+                && self.extra_drive_runtimes.is_empty(),
+            "existing device acquisitions must be released before sandbox start"
+        );
         self.launch.validate()?;
         trace!("launch config validated");
         match &self.launch {
@@ -1193,31 +1199,12 @@ impl FirecrackerSandbox {
         }
         self.envd_instance = None;
 
-        // Cleanup ublk device (must happen after FC stop, before network cleanup)
-        if let Some(runtime) = self.rootfs_runtime.take() {
-            if let Err(e) = UblkDeviceManager::global()
-                .release_device(&runtime.device)
-                .await
-            {
-                warn!(error = %e, "failed to release ublk device during stop");
-            }
-        }
-
-        // Shared memory device: release explicitly so a following resume for
-        // the same memory image cannot race the detached Drop cleanup.
-        if let Some(mem_device) = self.mem_ublk_device.take() {
-            if let Err(e) = mem_device.release().await {
-                warn!(error = %e, "failed to release shared memory ublk device during stop");
-            }
-        }
-
-        for runtime in self.extra_drive_runtimes.drain(..) {
-            if let Err(e) = UblkDeviceManager::global()
-                .release_device(&runtime.device)
-                .await
-            {
-                warn!(error = %e, "failed to release extra drive device during stop");
-            }
+        if self.rootfs_runtime.is_some()
+            || self.mem_ublk_device.is_some()
+            || !self.extra_drive_runtimes.is_empty()
+        {
+            self.release_ublk_devices(UblkDeviceManager::global())
+                .await?;
         }
 
         // Invoke the stop hook before releasing network resources. Delivery
@@ -1236,6 +1223,51 @@ impl FirecrackerSandbox {
         }
 
         debug!("firecracker sandbox stopped");
+        Ok(())
+    }
+
+    fn link_rootfs_runtime(
+        &mut self,
+        runtime: OverlaybdRuntimeHandle,
+        attachment: &Path,
+    ) -> Result<()> {
+        self.current_rootfs_virtual_size = Some(runtime.actual_virtual_size);
+        // start_nowait rejects existing acquisitions before allocating. Publish
+        // this receipt before the filesystem can fail, for the normal stop path.
+        self.rootfs_runtime = Some(runtime);
+        let device = &self
+            .rootfs_runtime
+            .as_ref()
+            .expect("published rootfs runtime")
+            .device;
+        std::os::unix::fs::symlink(device.device_path(), attachment)
+            .context("symlink user-rootfs to ublk device")
+    }
+
+    /// Keep the original receipt in the sandbox across failed or cancelled
+    /// RPCs. Remove a handle only after the daemon confirms its release.
+    async fn release_ublk_devices(&mut self, manager: &UblkDeviceManager) -> Result<()> {
+        if let Some(runtime) = self.rootfs_runtime.as_ref() {
+            manager
+                .release_device(&runtime.device)
+                .await
+                .context("release rootfs ublk device")?;
+            self.rootfs_runtime = None;
+        }
+        if let Some(device) = self.mem_ublk_device.as_ref() {
+            manager
+                .release_device(device)
+                .await
+                .context("release memory ublk device")?;
+            self.mem_ublk_device = None;
+        }
+        while let Some(runtime) = self.extra_drive_runtimes.last() {
+            manager
+                .release_device(&runtime.device)
+                .await
+                .context("release extra-drive ublk device")?;
+            self.extra_drive_runtimes.pop();
+        }
         Ok(())
     }
 
@@ -1543,27 +1575,14 @@ impl FirecrackerSandbox {
             .await
             .context("create user image overlaybd runtime device")?;
         self.rootfs_image_config_path = Some(rootfs_image_config.image_config_path.clone());
-        let device_path = runtime_device.device.device_path().to_path_buf();
-        let symlink_result = std::os::unix::fs::symlink(&device_path, &user_image_symlink)
-            .context("symlink user-rootfs to ublk device");
-        if let Err(err) = symlink_result {
-            if let Err(release_err) = UblkDeviceManager::global()
-                .release_device(&runtime_device.device)
-                .await
-            {
-                warn!(
-                    error = %release_err,
-                    "failed to release user image ublk device after symlink failure"
-                );
-            }
-            return Err(err);
-        }
-        self.rootfs_runtime = Some(OverlaybdRuntimeHandle {
-            device: runtime_device.device,
-            image_config_path: runtime_device.image_config_path,
-            actual_virtual_size: runtime_device.actual_virtual_size,
-        });
-        self.current_rootfs_virtual_size = Some(runtime_device.actual_virtual_size);
+        self.link_rootfs_runtime(
+            OverlaybdRuntimeHandle {
+                device: runtime_device.device,
+                image_config_path: runtime_device.image_config_path,
+                actual_virtual_size: runtime_device.actual_virtual_size,
+            },
+            &user_image_symlink,
+        )?;
 
         // ── Boot args: init=/init (tools drive has init baked in) ──
         let mut boot_args = config.boot_args.clone();
@@ -1581,25 +1600,19 @@ impl FirecrackerSandbox {
         }
 
         // ── Extra drives ──
-        let (extra_drive_attachments, extra_drive_runtimes) =
-            if config.common.extra_drives.is_empty() {
-                (Vec::new(), Vec::new())
-            } else {
-                let overlaybd_global = global_config.ublk.overlaybd.global_config_path.clone();
-                let runtime_upper_mode = global_config.ublk.overlaybd.runtime_upper_mode;
-                let allow_shrink = global_config.ublk.overlaybd.allow_shrink;
-                prepare_extra_drives(
-                    &config.common.extra_drives,
-                    &overlaybd_global,
-                    self.work_dir.path(),
-                    runtime_upper_mode,
-                    ExtraDrivePrepareMode::Fresh { allow_shrink },
-                )
-                .await
-                .context("prepare extra drives")?
-                .into_parts()
-            };
-        self.extra_drive_runtimes = extra_drive_runtimes;
+        let extra_drive_attachments = prepare_extra_drives(
+            &config.common.extra_drives,
+            &global_config.ublk.overlaybd.global_config_path,
+            self.work_dir.path(),
+            global_config.ublk.overlaybd.runtime_upper_mode,
+            ExtraDrivePrepareMode::Fresh {
+                allow_shrink: global_config.ublk.overlaybd.allow_shrink,
+            },
+            &mut self.extra_drive_runtimes,
+            UblkDeviceManager::global(),
+        )
+        .await
+        .context("prepare extra drives")?;
 
         // ── Boot args: extra drive mount points (agentenv_drives=vdc:...) ──
         if let Some(drives_arg) = build_drives_boot_arg(&config.common.extra_drives) {
@@ -1771,27 +1784,14 @@ impl FirecrackerSandbox {
                 .await
                 .context("create user image overlaybd runtime device for resume")?;
             self.rootfs_image_config_path = Some(rootfs_image_config.image_config_path.clone());
-            let device_path = runtime_device.device.device_path().to_path_buf();
-            let symlink_result = std::os::unix::fs::symlink(&device_path, &user_image_symlink)
-                .context("symlink user-rootfs to ublk device for resume");
-            if let Err(err) = symlink_result {
-                if let Err(release_err) = UblkDeviceManager::global()
-                    .release_device(&runtime_device.device)
-                    .await
-                {
-                    warn!(
-                        error = %release_err,
-                        "failed to release resumed user image ublk device after symlink failure"
-                    );
-                }
-                return Err(err);
-            }
-            self.rootfs_runtime = Some(OverlaybdRuntimeHandle {
-                device: runtime_device.device,
-                image_config_path: runtime_device.image_config_path,
-                actual_virtual_size: runtime_device.actual_virtual_size,
-            });
-            self.current_rootfs_virtual_size = Some(runtime_device.actual_virtual_size);
+            self.link_rootfs_runtime(
+                OverlaybdRuntimeHandle {
+                    device: runtime_device.device,
+                    image_config_path: runtime_device.image_config_path,
+                    actual_virtual_size: runtime_device.actual_virtual_size,
+                },
+                &user_image_symlink,
+            )?;
         }
 
         // ── Extra drives ──
@@ -1895,7 +1895,7 @@ impl FirecrackerSandbox {
             .overlaybd_global_config_path
             .clone();
         let mem_device = UblkDeviceManager::global()
-            .get_or_create_shared_mem(
+            .acquire_memory_device(
                 &UblkCreateSpec::Overlaybd {
                     image_config: config.mem_overlaybd_config.image_config_path.clone(),
                     global_config: mem_global_config,
@@ -2230,26 +2230,17 @@ impl FirecrackerSandbox {
         &mut self,
         extra_drives: &[ExtraDrive],
     ) -> Result<Vec<DriveMount>> {
-        if extra_drives.is_empty() {
-            self.extra_drive_runtimes.clear();
-            return Ok(Vec::new());
-        }
-
         let global_config = ConfigManager::global_config();
-        let ublk_config = &global_config.ublk;
-        let overlaybd_global = ublk_config.overlaybd.global_config_path.clone();
-        let runtime_upper_mode = ublk_config.overlaybd.runtime_upper_mode;
-        let prepared_extra_drives = prepare_extra_drives(
+        prepare_extra_drives(
             extra_drives,
-            &overlaybd_global,
+            &global_config.ublk.overlaybd.global_config_path,
             self.work_dir.path(),
-            runtime_upper_mode,
+            global_config.ublk.overlaybd.runtime_upper_mode,
             ExtraDrivePrepareMode::Resume,
+            &mut self.extra_drive_runtimes,
+            UblkDeviceManager::global(),
         )
-        .await?;
-        let (attachments, extra_drive_runtimes) = prepared_extra_drives.into_parts();
-        self.extra_drive_runtimes = extra_drive_runtimes;
-        Ok(attachments)
+        .await
     }
 
     async fn snapshot_extra_drives(&self, snapshot_dir: &Path) -> Result<Vec<ExtraDrive>> {
@@ -2410,6 +2401,10 @@ async fn copy_cow(src: &Path, dst: &Path) -> Result<()> {
     .await
     .context("copy_cow task failed")?
 }
+
+#[cfg(test)]
+#[path = "device_cleanup_tests.rs"]
+mod device_cleanup_tests;
 
 #[cfg(test)]
 mod tests {

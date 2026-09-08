@@ -37,14 +37,11 @@ ignored wait/cleanup errors, so cancellation lost its retry owner and filesystem
 failure returned success.
 
 Real subprocess and filesystem tests reproduce both failures against the
-preceding implementation. The fixed process contract does not yet establish the
-full native cleanup contract: `FirecrackerSandbox::stop` still logs and discards
-failed ublk releases, and a failed network-slot cleanup can release its bitmap
-reservation. These require further correction before native failure acceptance.
-The daemon now requires an acquisition identity for release and mutation, as
-described below. This establishes the identity boundary for cleanup retries;
-it does not repair the native handle lifecycle or prove cleanup after process
-death. Missing in-memory handles remain insufficient proof.
+preceding implementation. Process confirmation alone does not establish full
+native cleanup: a failed network-slot cleanup can still release its bitmap
+reservation, and interrupted native effects require reconciliation. Device
+receipt identity and native handle retention are described below. Missing
+in-memory handles remain insufficient proof after process death.
 
 ## Acquisition-owned device operations
 
@@ -81,7 +78,7 @@ The receipts and shared-key locks are currently retained in memory for the
 daemon lifetime. A new daemon rejects old receipts as unknown. Acquire-response
 loss is not reconciled and must not trigger blind reacquisition. Bounded receipt
 retention, durable resource reconciliation, shutdown versus in-flight operations
-and background refill, native shared-memory handle cleanup, network ownership,
+and background refill, network ownership,
 and target-host KVM/ublk failure qualification remain open. A receipt proves
 only this daemon's completed release operation; it is not a fleet-wide cleanup
 or restart recovery guarantee.
@@ -95,6 +92,53 @@ unknown/cross-device/nested/unwrapped requests, cancelled and failed release,
 legacy/malformed client responses, and real filesystem/ioctl failures. The
 kernel executor is substituted in ownership tests; these do not qualify native
 device failure cleanup or the remaining lifecycle gaps.
+
+## Native device handle retention
+
+After confirmed Firecracker exit, native stop borrows the rootfs, memory and
+extra-drive receipts through their release RPCs. It removes each receipt only
+after a successful response. Errors propagate and cancellation leaves the
+original receipt in the sandbox. A later attempt replays that identity; it does
+not reacquire a device or invent a new release owner. An unresolved daemon error
+stays an error. Only a known completed release can return its prior success.
+
+Rootfs creation publishes its receipt before linking the device into the working
+directory. Extra-drive preparation similarly writes each acquired receipt into
+the sandbox's vector immediately, before linking or awaiting the next device.
+A symlink failure, a later acquisition error, or cancellation therefore retains
+all receipts already received. Cleanup uses the normal stop path. Temporary
+preparation state no longer swallows release errors or loses earlier devices
+when its future is dropped. Starting again with retained receipts is rejected
+before another allocation. This does not resolve a lost acquisition reply: the
+unacknowledged daemon-side resource still requires reconciliation.
+
+The local weak-reference memory-device cache and detached last-reference release
+are removed. Each sandbox owns a distinct acquisition receipt. With pooling
+enabled, the daemon continues sharing the underlying read-only memory device and
+its page cache. With pooling disabled, memory devices are private raw devices;
+the former local sharing optimization no longer applies. This changes resource
+use for pool-disabled hosts and requires capacity qualification. Abnormal drop
+does not asynchronously recycle a memory device whose Firecracker user may still
+be alive. The daemon retains that acquisition; drop is not successful cleanup.
+
+This native lifecycle cutover requires the acquisition-owned protocol and a
+coordinated, drained server/daemon update. No public HTTP or persisted record
+schema changes are added. Preserve all earlier drain, state and rollback rules.
+Target-host boot, pause/resume, shared-memory capacity and failure cleanup remain
+unqualified for this revision. Network release ownership, daemon shutdown races,
+durable/bounded receipt retention and recovery after process loss remain open.
+
+Focused tests drive the production manager/client over Unix sockets and use real
+filesystem obstructions. They cover cancellation for all three device classes,
+lost reply replay, repeated unresolved errors, independent shared consumers,
+rootfs linking failure, and extra-drive linking/cancellation after partial
+preparation. The peer is scripted; these tests prove native handle ownership,
+not kernel deletion or resolution of an interrupted daemon-side effect.
+Reintroducing the pre-release take, post-link publication and temporary-vector
+ownership patterns makes six of the seven focused cases fail. With the fixes,
+85 Firecracker, 3 ublk-manager, 10 extra-drive, 144 orchestrator and 97 daemon
+tests pass (339 distinct cases), along with all-target/all-feature clippy with
+warnings denied and workspace formatting.
 
 ## Delete and restart
 

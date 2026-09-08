@@ -1,14 +1,12 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use dashmap::DashMap;
 use overlaybd::config::UpperMode;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Notify, OnceCell};
-use tracing::{debug, info, warn};
+use tokio::sync::OnceCell;
+use tracing::{debug, warn};
 use uvm_ublk_daemon::{
     CreateOverlaybdRuntimeDeviceRequest, RestackSnapshotStats, RestackSnapshotTerminalFailure,
     UblkDaemonClient, UblkDaemonSpawnConfig,
@@ -162,23 +160,13 @@ fn runtime_device_timeout(resize_timeout_secs: u64) -> Duration {
 /// Wraps the daemon client for device lifecycle management. Device IDs are
 /// assigned by the kernel and returned by the daemon.
 ///
-/// Also maintains a pool of shared memory ublk devices keyed by canonical
-/// `image_config` path. Multiple sandboxes using the same memory snapshot
-/// image share a single read-only ublk device (and thus the same page cache).
+/// The daemon owns sharing and reference counts. Each sandbox retains a distinct
+/// acquisition receipt until its own release is confirmed.
 ///
-/// Initialized once via [`init_global`] (which spawns the daemon if
-/// configured). Accessed everywhere else via [`global`].
+/// Initialized once via [`Self::init_global`] and accessed via [`Self::global`].
 pub struct UblkDeviceManager {
     client: Option<Arc<UblkDaemonClient>>,
     pool_enabled: bool,
-    /// Pool of shared memory ublk devices, keyed by canonical image config path.
-    /// Values are `Weak` references: when the last `SharedMemDevice` handle is
-    /// dropped, the device is deleted asynchronously and the entry becomes stale.
-    shared_mem_devices: DashMap<PathBuf, Weak<SharedMemDeviceInner>>,
-    /// Per-image notifications for asynchronous shared-memory releases. A new
-    /// acquire for the same image waits until the previous last-handle release
-    /// has completed so the daemon does not reuse stale opened image state.
-    shared_mem_releases: DashMap<PathBuf, Arc<Notify>>,
 }
 
 static GLOBAL_MANAGER: OnceCell<UblkDeviceManager> = OnceCell::const_new();
@@ -188,8 +176,6 @@ impl UblkDeviceManager {
         Self {
             client,
             pool_enabled,
-            shared_mem_devices: DashMap::new(),
-            shared_mem_releases: DashMap::new(),
         }
     }
 
@@ -458,239 +444,47 @@ impl UblkDeviceManager {
         }
     }
 
-    // ── Shared memory device pool ───────────────────────────────────────
-
-    /// Get or create a shared, reference-counted memory ublk device.
-    ///
-    /// Shared memory devices are read-only overlaybd devices that can be
-    /// used by multiple sandboxes simultaneously. When multiple sandboxes
-    /// boot from the same snapshot template, they share a single ublk
-    /// device (and thus the same Linux page cache).
-    ///
-    /// The device is deleted automatically when the last [`SharedMemDevice`]
-    /// handle is dropped.
-    pub(crate) async fn get_or_create_shared_mem(
+    /// Acquire this sandbox's memory device receipt. With pooling enabled the
+    /// daemon shares the read-only device, but gives each caller a separate
+    /// acquisition. Without pooling, each caller owns a raw device.
+    pub(crate) async fn acquire_memory_device(
         &self,
         spec: &UblkCreateSpec,
         virtual_size: u64,
-    ) -> Result<SharedMemDevice> {
+    ) -> Result<UblkDevice> {
         let UblkCreateSpec::Overlaybd {
             image_config,
             global_config,
         } = spec;
-
-        let key = std::fs::canonicalize(image_config).unwrap_or_else(|_| image_config.clone());
-
-        loop {
-            // If the previous last handle is still releasing the daemon-side
-            // shared device, wait before acquiring the same key again.
-            if let Some(notify) = self
-                .shared_mem_releases
-                .get(&key)
-                .map(|entry| Arc::clone(entry.value()))
-            {
-                notify.notified().await;
-                continue;
-            }
-
-            // Fast path: try to upgrade an existing Weak reference.
-            if let Some(weak) = self.shared_mem_devices.get(&key) {
-                if let Some(strong) = weak.upgrade() {
-                    debug!(
-                        key = %key.display(),
-                        dev_id = strong.device.dev_id,
-                        "reusing shared memory ublk device"
-                    );
-                    return Ok(SharedMemDevice { inner: strong });
-                }
-            }
-            break;
-        }
-
-        let device = if self.pool_enabled {
-            let client = self.require_client()?;
-            let mut metric =
-                MetricGuard::operation(UBLK_OPERATION_DURATION, "acquire_shared_memory");
-            let acquired = client
-                .acquire_overlaybd(
-                    image_config,
-                    global_config,
-                    virtual_size,
-                    uvm_ublk_daemon::AccessMode::Shared,
-                )
+        if !self.pool_enabled {
+            return self
+                .create_raw_overlaybd_device(spec)
                 .await
-                .context("acquire shared memory ublk device");
-            metric.finish(&acquired);
-            let (dev_id, device_path, lease) = acquired?;
-
-            UblkDevice {
-                dev_id,
-                device_path,
-                lease,
-            }
-        } else {
-            self.create_raw_overlaybd_device(spec)
-                .await
-                .context("create shared memory ublk device")?
-        };
-
-        info!(
-            key = %key.display(),
-            dev_id = device.dev_id,
-            path = %device.device_path.display(),
-            "created or acquired shared memory ublk device"
-        );
-
-        let inner = Arc::new(SharedMemDeviceInner {
-            device,
-            image_config_key: key.clone(),
-            released: AtomicBool::new(false),
-        });
-
-        // Use the entry API to avoid overwriting a live Weak inserted by a
-        // concurrent caller that won the race.
-        let mut entry = self
-            .shared_mem_devices
-            .entry(key)
-            .or_insert_with(|| Arc::downgrade(&inner));
-        if let Some(winner) = entry.upgrade() {
-            if !Arc::ptr_eq(&winner, &inner) {
-                // Another caller inserted a live device while we were acquiring
-                // ours. Reuse theirs; `inner` will be dropped, triggering
-                // automatic cleanup of our redundant device.
-                debug!(
-                    dev_id = inner.device.dev_id,
-                    winner_dev_id = winner.device.dev_id,
-                    "concurrent caller won the race, reusing their shared memory device"
-                );
-                return Ok(SharedMemDevice { inner: winner });
-            }
-        } else {
-            // The existing entry was stale (Weak::upgrade failed). Replace it
-            // with our freshly-created device.
-            *entry = Arc::downgrade(&inner);
+                .context("create memory ublk device");
         }
-
-        Ok(SharedMemDevice { inner })
-    }
-}
-
-// ── Shared memory device ────────────────────────────────────────────────────
-
-/// Inner state of a shared memory ublk device.
-///
-/// When the last `Arc<SharedMemDeviceInner>` is dropped, the device is
-/// deleted asynchronously and the stale entry is removed from the pool.
-struct SharedMemDeviceInner {
-    device: UblkDevice,
-    /// Canonical key used for the shared device pool lookup.
-    image_config_key: PathBuf,
-    released: AtomicBool,
-}
-
-impl Drop for SharedMemDeviceInner {
-    fn drop(&mut self) {
-        if self.released.swap(true, Ordering::AcqRel) {
-            return;
-        }
-
-        let dev_id = self.device.dev_id;
-        let key = self.image_config_key.clone();
-        let device_path = self.device.device_path.clone();
-        let device = UblkDevice {
+        let client = self.require_client()?;
+        let mut metric = MetricGuard::operation(UBLK_OPERATION_DURATION, "acquire_shared_memory");
+        let acquired = client
+            .acquire_overlaybd(
+                image_config,
+                global_config,
+                virtual_size,
+                uvm_ublk_daemon::AccessMode::Shared,
+            )
+            .await
+            .context("acquire memory ublk device");
+        metric.finish(&acquired);
+        let (dev_id, device_path, lease) = acquired?;
+        Ok(UblkDevice {
             dev_id,
             device_path,
-            lease: self.device.lease.clone(),
-        };
-        let notify = Arc::new(Notify::new());
-        UblkDeviceManager::global()
-            .shared_mem_releases
-            .insert(key.clone(), Arc::clone(&notify));
-        info!(
-            dev_id,
-            key = %key.display(),
-            "last reference to shared memory ublk device dropped, scheduling release"
-        );
-        // Remove the stale Weak entry from the pool and release the device.
-        // Both operations happen on a detached task to avoid blocking the
-        // caller's drop path.
-        //
-        // Use Handle::try_current() to guard against the case where Drop runs
-        // after the tokio runtime has shut down (e.g. during static destructor
-        // ordering at process exit). In that scenario we skip async cleanup —
-        // the ublk daemon process is exiting anyway and the kernel will reclaim
-        // the devices.
-        let Some(handle) = tokio::runtime::Handle::try_current().ok() else {
-            warn!(
-                dev_id,
-                "tokio runtime unavailable during drop, skipping async device cleanup"
-            );
-            UblkDeviceManager::global()
-                .shared_mem_releases
-                .remove_if(&key, |_, existing| Arc::ptr_eq(existing, &notify));
-            notify.notify_waiters();
-            return;
-        };
-        handle.spawn(async move {
-            let _ = release_shared_mem_device(key, device, notify).await;
-        });
-    }
-}
-
-async fn release_shared_mem_device(
-    key: PathBuf,
-    device: UblkDevice,
-    notify: Arc<Notify>,
-) -> Result<()> {
-    let dev_id = device.dev_id;
-
-    // Remove stale entry — only if it's still our Weak (not replaced by a
-    // fresh entry for the same key).
-    UblkDeviceManager::global()
-        .shared_mem_devices
-        .remove_if(&key, |_, weak| weak.strong_count() == 0);
-
-    let release_result = UblkDeviceManager::global().release_device(&device).await;
-    if let Err(e) = &release_result {
-        warn!(dev_id, error = %e, "failed to release shared memory ublk device");
-    }
-    UblkDeviceManager::global()
-        .shared_mem_releases
-        .remove_if(&key, |_, existing| Arc::ptr_eq(existing, &notify));
-    notify.notify_waiters();
-    release_result
-}
-
-/// A shared, reference-counted handle to a read-only memory ublk device.
-///
-/// Cloning this handle increments the reference count. The underlying ublk
-/// device is deleted only when the last handle is dropped.
-#[derive(Clone)]
-pub(crate) struct SharedMemDevice {
-    inner: Arc<SharedMemDeviceInner>,
-}
-
-impl SharedMemDevice {
-    /// The `/dev/ublkb<N>` path of this device.
-    pub fn device_path(&self) -> &Path {
-        self.inner.device.device_path()
+            lease,
+        })
     }
 
-    pub async fn release(self) -> Result<()> {
-        if Arc::strong_count(&self.inner) != 1 {
-            return Ok(());
-        }
-        if self.inner.released.swap(true, Ordering::AcqRel) {
-            return Ok(());
-        }
-
-        let key = self.inner.image_config_key.clone();
-        let device = self.inner.device.clone();
-        let notify = Arc::new(Notify::new());
-        UblkDeviceManager::global()
-            .shared_mem_releases
-            .insert(key.clone(), Arc::clone(&notify));
-        release_shared_mem_device(key, device, notify).await
+    #[cfg(test)]
+    pub(crate) fn with_test_client(client: Arc<UblkDaemonClient>, pool_enabled: bool) -> Self {
+        Self::new(Some(client), pool_enabled)
     }
 }
 

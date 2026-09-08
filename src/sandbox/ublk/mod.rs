@@ -1,8 +1,11 @@
 mod device;
 mod overlaybd;
 
-pub(crate) use device::{SharedMemDevice, UblkCreateSpec, UblkDevice};
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub use device::{UblkBackend, UblkConfig, UblkDaemonConfig, UblkDeviceManager};
+pub(crate) use device::{UblkCreateSpec, UblkDevice};
 pub use overlaybd::OverlaybdConfig;
 pub(crate) use overlaybd::{
     compact_layers, create_commit_args, OverlaybdCompactOutput, OverlaybdRuntimeHandle,
